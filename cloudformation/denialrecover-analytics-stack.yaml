@@ -1,0 +1,453 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DenialRecover AI - Analytics Layer (Redshift Serverless + QuickSight)'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: denialrecover
+  DataStackName:
+    Type: String
+    Default: denialrecover-dev
+  AdminUsername:
+    Type: String
+    Default: admin
+    Description: Redshift admin username
+  AdminPassword:
+    Type: String
+    NoEcho: true
+    Default: DenialRecover2024!
+    Description: Redshift admin password (min 8 chars, upper, lower, number)
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Additional Subnets in existing VPC (Redshift needs 3 AZs)
+  # ---------------------------------------------------------------------------
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: vpc-0f59e6a70abf16538
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: us-east-1b
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-2'
+
+  PrivateSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: vpc-0f59e6a70abf16538
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: us-east-1c
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-3'
+
+  RedshiftSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Redshift Serverless
+      VpcId: vpc-0f59e6a70abf16538
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5439
+          ToPort: 5439
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-redshift-sg'
+
+  # ---------------------------------------------------------------------------
+  # Redshift Serverless
+  # ---------------------------------------------------------------------------
+  RedshiftNamespace:
+    Type: AWS::RedshiftServerless::Namespace
+    Properties:
+      NamespaceName: !Sub '${ProjectName}-${Environment}-namespace'
+      AdminUsername: !Ref AdminUsername
+      AdminUserPassword: !Ref AdminPassword
+      DbName: denialrecover
+      DefaultIamRoleArn: !GetAtt RedshiftRole.Arn
+      IamRoles:
+        - !GetAtt RedshiftRole.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RedshiftWorkgroup:
+    Type: AWS::RedshiftServerless::Workgroup
+    Properties:
+      WorkgroupName: !Sub '${ProjectName}-${Environment}-workgroup'
+      NamespaceName: !Ref RedshiftNamespace
+      BaseCapacity: 32
+      PubliclyAccessible: false
+      SubnetIds:
+        - subnet-0a4727df18572acea
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      SecurityGroupIds:
+        - !Ref RedshiftSecurityGroup
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  RedshiftRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-redshift-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: redshift.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RedshiftPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-DenialAnalysisTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableArn'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+
+
+  # ---------------------------------------------------------------------------
+  # Lambda for DynamoDB to Redshift Sync
+  # ---------------------------------------------------------------------------
+  DataSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-data-sync-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DataSyncPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-DenialAnalysisTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableArn'
+              - Effect: Allow
+                Action:
+                  - redshift-data:ExecuteStatement
+                  - redshift-data:GetStatementResult
+                  - redshift-data:DescribeStatement
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - redshift-serverless:GetCredentials
+                Resource: !Sub 'arn:aws:redshift-serverless:${AWS::Region}:${AWS::AccountId}:workgroup/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub 
+                    - '${BucketArn}/analytics/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+
+  DataSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-data-sync'
+      Description: Syncs DynamoDB data to Redshift for analytics
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 300
+      Role: !GetAtt DataSyncLambdaRole.Arn
+      Environment:
+        Variables:
+          CLAIMS_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-ClaimsTable'
+          WORKGROUP_NAME: !Ref RedshiftWorkgroup
+          DATABASE_NAME: denialrecover
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from datetime import datetime
+
+          dynamodb = boto3.resource('dynamodb')
+          redshift_data = boto3.client('redshift-data')
+
+          CLAIMS_TABLE = os.environ['CLAIMS_TABLE']
+          WORKGROUP_NAME = os.environ['WORKGROUP_NAME']
+          DATABASE_NAME = os.environ['DATABASE_NAME']
+
+          def handler(event, context):
+              # Create tables if not exist
+              create_tables()
+              
+              # Sync claims data
+              sync_claims()
+              
+              # Update denial trends
+              update_denial_trends()
+              
+              # Update recovery summary
+              update_recovery_summary()
+              
+              return {'statusCode': 200, 'body': 'Sync completed'}
+
+          def create_tables():
+              sql = '''
+              CREATE TABLE IF NOT EXISTS claims (
+                  claim_id VARCHAR(100) PRIMARY KEY,
+                  patient_id VARCHAR(100),
+                  patient_name VARCHAR(200),
+                  payer VARCHAR(200),
+                  status VARCHAR(50),
+                  claim_amount DECIMAL(10,2),
+                  denial_code VARCHAR(20),
+                  denial_category VARCHAR(200),
+                  success_probability INT,
+                  priority_score INT,
+                  expected_recovery DECIMAL(10,2),
+                  recovery_opportunity VARCHAR(50),
+                  appeal_deadline VARCHAR(50),
+                  created_at VARCHAR(50),
+                  updated_at VARCHAR(50)
+              );
+              
+              CREATE TABLE IF NOT EXISTS denial_trends (
+                  trend_date DATE,
+                  payer VARCHAR(200),
+                  denial_code VARCHAR(20),
+                  denial_category VARCHAR(200),
+                  claim_count INT,
+                  total_amount DECIMAL(12,2),
+                  avg_success_rate DECIMAL(5,2)
+              );
+              
+              CREATE TABLE IF NOT EXISTS recovery_summary (
+                  summary_date DATE,
+                  total_denied DECIMAL(12,2),
+                  total_recovered DECIMAL(12,2),
+                  total_expected DECIMAL(12,2),
+                  pending_appeals INT,
+                  success_rate DECIMAL(5,2),
+                  high_priority_count INT
+              );
+              '''
+              
+              execute_sql(sql)
+
+          def sync_claims():
+              # Full refresh: truncate and reload from DynamoDB
+              execute_sql("TRUNCATE TABLE claims;")
+              
+              table = dynamodb.Table(CLAIMS_TABLE)
+              
+              # Paginate through ALL items
+              all_items = []
+              response = table.scan()
+              all_items.extend(response.get('Items', []))
+              
+              while 'LastEvaluatedKey' in response:
+                  response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                  all_items.extend(response.get('Items', []))
+              
+              print(f"Total items from DynamoDB: {len(all_items)}")
+              
+              # Batch inserts (50 at a time) for efficiency
+              batch_size = 50
+              for i in range(0, len(all_items), batch_size):
+                  batch = all_items[i:i+batch_size]
+                  values_list = []
+                  
+                  for item in batch:
+                      claim_id = str(item.get('claimId', '')).replace("'", "''")
+                      patient_id = str(item.get('patientId', '')).replace("'", "''")
+                      patient_name = str(item.get('patientName', '')).replace("'", "''")
+                      payer = str(item.get('payer', 'unknown')).replace("'", "''")
+                      status = str(item.get('status', '')).replace("'", "''")
+                      claim_amount = item.get('claimAmount', 0)
+                      denial_code = str(item.get('denialCode', '')).replace("'", "''")
+                      denial_category = str(item.get('denialCategory', '')).replace("'", "''")
+                      success_prob = int(item.get('successProbability', 0))
+                      priority = int(item.get('priorityScore', 0))
+                      expected_rec = float(item.get('expectedRecovery', 0))
+                      recovery_opp = str(item.get('recoveryOpportunity', '')).replace("'", "''")
+                      appeal_deadline = str(item.get('appealDeadline', '')).replace("'", "''")
+                      created = str(item.get('createdAt', '')).replace("'", "''")
+                      updated = str(item.get('updatedAt', '')).replace("'", "''")
+                      
+                      values_list.append(
+                          f"('{claim_id}','{patient_id}','{patient_name}','{payer}','{status}',"
+                          f"{claim_amount},'{denial_code}','{denial_category}',{success_prob},"
+                          f"{priority},{expected_rec},'{recovery_opp}','{appeal_deadline}',"
+                          f"'{created}','{updated}')"
+                      )
+                  
+                  if values_list:
+                      sql = f"INSERT INTO claims VALUES {','.join(values_list)};"
+                      execute_sql(sql)
+              
+              print(f"Synced {len(all_items)} claims to Redshift")
+
+          def update_denial_trends():
+              execute_sql("TRUNCATE TABLE denial_trends;")
+              sql = """
+              INSERT INTO denial_trends
+              SELECT 
+                  CURRENT_DATE as trend_date,
+                  payer,
+                  denial_code,
+                  denial_category,
+                  COUNT(*) as claim_count,
+                  SUM(claim_amount) as total_amount,
+                  AVG(success_probability) as avg_success_rate
+              FROM claims
+              WHERE denial_code != ''
+              GROUP BY payer, denial_code, denial_category;
+              """
+              execute_sql(sql)
+
+          def update_recovery_summary():
+              execute_sql("TRUNCATE TABLE recovery_summary;")
+              sql = """
+              INSERT INTO recovery_summary
+              SELECT
+                  CURRENT_DATE as summary_date,
+                  SUM(claim_amount) as total_denied,
+                  SUM(CASE WHEN status = 'recovered' THEN claim_amount ELSE 0 END) as total_recovered,
+                  SUM(expected_recovery) as total_expected,
+                  COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_appeals,
+                  CASE WHEN COUNT(*) > 0 THEN AVG(success_probability) ELSE 0 END as success_rate,
+                  COUNT(CASE WHEN recovery_opportunity = 'High' THEN 1 END) as high_priority_count
+              FROM claims;
+              """
+              execute_sql(sql)
+
+          def execute_sql(sql):
+              try:
+                  response = redshift_data.execute_statement(
+                      WorkgroupName=WORKGROUP_NAME,
+                      Database=DATABASE_NAME,
+                      Sql=sql
+                  )
+                  return response['Id']
+              except Exception as e:
+                  print(f"SQL Error: {e}")
+                  return None
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Schedule data sync every hour
+  DataSyncSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-data-sync-schedule'
+      Description: Trigger data sync every hour
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Id: DataSyncTarget
+          Arn: !GetAtt DataSyncFunction.Arn
+
+  DataSyncPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataSyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataSyncSchedule.Arn
+
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  RedshiftWorkgroupEndpoint:
+    Description: Redshift Serverless workgroup endpoint
+    Value: !GetAtt RedshiftWorkgroup.Workgroup.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftEndpoint'
+
+  RedshiftWorkgroupName:
+    Description: Redshift Serverless workgroup name
+    Value: !Ref RedshiftWorkgroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftWorkgroup'
+
+  RedshiftNamespaceName:
+    Description: Redshift Serverless namespace name
+    Value: !Ref RedshiftNamespace
+    Export:
+      Name: !Sub '${AWS::StackName}-RedshiftNamespace'
+
+  AnalyticsVPCId:
+    Description: VPC ID for analytics
+    Value: vpc-0f59e6a70abf16538
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC'
+
+  QuickSightSetupInstructions:
+    Description: Instructions to set up QuickSight dashboard
+    Value: |
+      QuickSight Dashboard Setup:
+      1. Go to AWS QuickSight Console
+      2. Create new analysis with Redshift data source
+      3. Connect to workgroup endpoint with admin credentials
+      4. Create datasets from tables: claims, denial_trends, recovery_summary
+      5. Build visualizations:
+         - Total Recoverable Revenue (KPI)
+         - Denial Trends by Payer (Bar Chart)
+         - Appeal Success Rate (Gauge)
+         - Priority Queue (Table)
+         - Recovery Timeline (Line Chart)
+         - Denial Reasons Distribution (Pie Chart)
+      6. Publish as dashboard: "DenialRecover Revenue Recovery"

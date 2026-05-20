@@ -1,0 +1,646 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DenialRecover AI - Data Layer (S3 Buckets & DynamoDB Tables)'
+
+# =============================================================================
+# PARAMETERS
+# =============================================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - uat
+      - prod
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: denialrecover
+    Description: Project name for resource naming
+
+# =============================================================================
+# RESOURCES
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # KMS Key for Encryption
+  # ---------------------------------------------------------------------------
+  KMSKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub '${ProjectName}-${Environment} encryption key'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow S3 Service
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow Lambda Service
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}-key'
+      TargetKeyId: !Ref KMSKey
+
+  # ---------------------------------------------------------------------------
+  # S3 Buckets
+  # ---------------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-data-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntakeLifecycle
+            Status: Enabled
+            Prefix: intake/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+              - StorageClass: GLACIER
+                TransitionInDays: 365
+            ExpirationInDays: 2555
+          - Id: ProcessedLifecycle
+            Status: Enabled
+            Prefix: processed/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 180
+              - StorageClass: GLACIER
+                TransitionInDays: 730
+            ExpirationInDays: 2555
+          - Id: AppealsLifecycle
+            Status: Enabled
+            Prefix: appeals/
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 365
+              - StorageClass: GLACIER
+                TransitionInDays: 1095
+            ExpirationInDays: 3650
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnforceHTTPS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DataBucket.Arn
+              - !Sub '${DataBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  PayerRulesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-payer-rules-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KMSKey
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB Tables
+  # ---------------------------------------------------------------------------
+  ClaimsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-claims'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: claimId
+          AttributeType: S
+        - AttributeName: payerId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: serviceDate
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: appealDeadline
+          AttributeType: S
+      KeySchema:
+        - AttributeName: claimId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: payer-index
+          KeySchema:
+            - AttributeName: payerId
+              KeyType: HASH
+            - AttributeName: serviceDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: deadline-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: appealDeadline
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DenialAnalysisTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-denial-analysis'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: claimId
+          AttributeType: S
+        - AttributeName: analysisId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: claimId
+          KeyType: HASH
+        - AttributeName: analysisId
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PriorityQueueTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-priority-queue'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: queueId
+          AttributeType: S
+        - AttributeName: expectedValue
+          AttributeType: 'N'
+        - AttributeName: claimId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: queueId
+          KeyType: HASH
+        - AttributeName: expectedValue
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: claim-lookup
+          KeySchema:
+            - AttributeName: claimId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AppealOutcomesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-appeal-outcomes'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: claimId
+          AttributeType: S
+        - AttributeName: appealId
+          AttributeType: S
+        - AttributeName: payerId
+          AttributeType: S
+        - AttributeName: outcomeDate
+          AttributeType: S
+      KeySchema:
+        - AttributeName: claimId
+          KeyType: HASH
+        - AttributeName: appealId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: payer-outcome
+          KeySchema:
+            - AttributeName: payerId
+              KeyType: HASH
+            - AttributeName: outcomeDate
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Companies Table (Multi-Tenant Support)
+  # ---------------------------------------------------------------------------
+  CompaniesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-companies'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: companyId
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: companyId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # SQS Queues for Batch Processing
+  # ---------------------------------------------------------------------------
+  
+  # Dead Letter Queue for failed messages
+  ClaimsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-claims-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: !Ref KMSKey
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Main Claims Processing Queue
+  ClaimsProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-claims-queue'
+      VisibilityTimeout: 900  # 15 minutes (should be 6x Lambda timeout)
+      MessageRetentionPeriod: 345600  # 4 days
+      ReceiveMessageWaitTimeSeconds: 20  # Long polling
+      KmsMasterKeyId: !Ref KMSKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ClaimsDeadLetterQueue.Arn
+        maxReceiveCount: 3  # Retry 3 times before sending to DLQ
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Queue Policy - Allow S3 to send messages
+  ClaimsQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref ClaimsProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3ToSendMessage
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ClaimsProcessingQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-data-${AWS::AccountId}'
+          - Sid: AllowLambdaToReceiveMessage
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt ClaimsProcessingQueue.Arn
+
+  # High Priority Queue for urgent claims (appeal deadline approaching)
+  HighPriorityClaimsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-claims-high-priority'
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      KmsMasterKeyId: !Ref KMSKey
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ClaimsDeadLetterQueue.Arn
+        maxReceiveCount: 5  # More retries for high priority
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # High Priority Queue Policy
+  HighPriorityQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref HighPriorityClaimsQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLambdaAccess
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+            Resource: !GetAtt HighPriorityClaimsQueue.Arn
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  DataBucketName:
+    Description: Name of the data S3 bucket
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucket'
+
+  DataBucketArn:
+    Description: ARN of the data S3 bucket
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  PayerRulesBucketName:
+    Description: Name of the payer rules S3 bucket
+    Value: !Ref PayerRulesBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-PayerRulesBucket'
+
+  PayerRulesBucketArn:
+    Description: ARN of the payer rules S3 bucket
+    Value: !GetAtt PayerRulesBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PayerRulesBucketArn'
+
+  ClaimsTableName:
+    Description: Name of the claims DynamoDB table
+    Value: !Ref ClaimsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsTable'
+
+  ClaimsTableArn:
+    Description: ARN of the claims DynamoDB table
+    Value: !GetAtt ClaimsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsTableArn'
+
+  ClaimsTableStreamArn:
+    Description: ARN of the claims DynamoDB table stream
+    Value: !GetAtt ClaimsTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsTableStreamArn'
+
+  DenialAnalysisTableName:
+    Description: Name of the denial analysis DynamoDB table
+    Value: !Ref DenialAnalysisTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DenialAnalysisTable'
+
+  DenialAnalysisTableArn:
+    Description: ARN of the denial analysis DynamoDB table
+    Value: !GetAtt DenialAnalysisTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DenialAnalysisTableArn'
+
+  PriorityQueueTableName:
+    Description: Name of the priority queue DynamoDB table
+    Value: !Ref PriorityQueueTable
+    Export:
+      Name: !Sub '${AWS::StackName}-PriorityQueueTable'
+
+  PriorityQueueTableArn:
+    Description: ARN of the priority queue DynamoDB table
+    Value: !GetAtt PriorityQueueTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PriorityQueueTableArn'
+
+  AppealOutcomesTableName:
+    Description: Name of the appeal outcomes DynamoDB table
+    Value: !Ref AppealOutcomesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-AppealOutcomesTable'
+
+  AppealOutcomesTableArn:
+    Description: ARN of the appeal outcomes DynamoDB table
+    Value: !GetAtt AppealOutcomesTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppealOutcomesTableArn'
+
+  AppealOutcomesTableStreamArn:
+    Description: ARN of the appeal outcomes DynamoDB table stream
+    Value: !GetAtt AppealOutcomesTable.StreamArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AppealOutcomesTableStreamArn'
+
+  CompaniesTableName:
+    Description: Name of the companies DynamoDB table
+    Value: !Ref CompaniesTable
+    Export:
+      Name: !Sub '${AWS::StackName}-CompaniesTable'
+
+  CompaniesTableArn:
+    Description: ARN of the companies DynamoDB table
+    Value: !GetAtt CompaniesTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CompaniesTableArn'
+
+  KMSKeyArn:
+    Description: ARN of the KMS key
+    Value: !GetAtt KMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKey'
+
+  # SQS Queue Outputs
+  ClaimsQueueUrl:
+    Description: URL of the claims processing SQS queue
+    Value: !Ref ClaimsProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsQueueUrl'
+
+  ClaimsQueueArn:
+    Description: ARN of the claims processing SQS queue
+    Value: !GetAtt ClaimsProcessingQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsQueueArn'
+
+  ClaimsDLQUrl:
+    Description: URL of the claims dead letter queue
+    Value: !Ref ClaimsDeadLetterQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsDLQUrl'
+
+  ClaimsDLQArn:
+    Description: ARN of the claims dead letter queue
+    Value: !GetAtt ClaimsDeadLetterQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ClaimsDLQArn'
+
+  HighPriorityQueueUrl:
+    Description: URL of the high priority claims queue
+    Value: !Ref HighPriorityClaimsQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-HighPriorityQueueUrl'
+
+  HighPriorityQueueArn:
+    Description: ARN of the high priority claims queue
+    Value: !GetAtt HighPriorityClaimsQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-HighPriorityQueueArn'
+
+  UploadCommand:
+    Description: Command to upload sample data
+    Value: !Sub 'aws s3 sync ./SharePoint_Upload s3://${DataBucket}/'

@@ -1,0 +1,2228 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DenialRecover AI - Bedrock Agent + OpenSearch Knowledge Base'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: denialrecover
+  DataStackName:
+    Type: String
+    Default: denialrecover-dev
+    Description: Name of the data stack to import resources from
+  OpenSearchLayerArn:
+    Type: String
+    Default: arn:aws:lambda:us-east-1:193786182229:layer:denialrecover-dev-opensearch-layer:1
+    Description: ARN of the Lambda Layer containing opensearch-py and requests-aws4auth
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # OpenSearch Serverless Collection (Knowledge Base)
+  # ---------------------------------------------------------------------------
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-encryption'
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${ProjectName}-${Environment}-kb"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-network'
+      Type: network
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-${Environment}-kb"]
+              },
+              {
+                "ResourceType": "dashboard",
+                "Resource": ["collection/${ProjectName}-${Environment}-kb"]
+              }
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    DependsOn:
+      - OpenSearchManagerRole
+      - AgentActionLambdaRole
+      - OpenSearchRealtimeSyncRole
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-access'
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-${Environment}-kb"],
+                "Permission": ["aoss:*"]
+              },
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${ProjectName}-${Environment}-kb/*"],
+                "Permission": ["aoss:*"]
+              }
+            ],
+            "Principal": [
+              "arn:aws:iam::${AWS::AccountId}:root",
+              "${BedrockAgentRole.Arn}",
+              "${KnowledgeBaseRole.Arn}",
+              "${OpenSearchManagerRole.Arn}",
+              "${AgentActionLambdaRole.Arn}",
+              "${OpenSearchRealtimeSyncRole.Arn}"
+            ]
+          }
+        ]
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-kb'
+      Type: VECTORSEARCH
+      Description: Knowledge base for payer policies and claim history
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+
+  # ---------------------------------------------------------------------------
+  # IAM Roles
+  # ---------------------------------------------------------------------------
+  KnowledgeBaseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-kb-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: KnowledgeBasePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAgentPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-DenialAnalysisTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-PriorityQueueTableArn'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Environment}-*'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions for Agent Action Groups
+  # ---------------------------------------------------------------------------
+  AgentActionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-agent-action-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AgentActionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-DenialAnalysisTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-PriorityQueueTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-CompaniesTableArn'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+              # OpenSearch permissions for SearchPoliciesFunction
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              # Bedrock permissions for embedding generation
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+
+  # Action Group Lambda - Query Claims (with Multi-Tenant Support)
+  QueryClaimsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-query-claims'
+      Description: Agent action to query claims from DynamoDB with company filtering
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt AgentActionLambdaRole.Arn
+      Environment:
+        Variables:
+          CLAIMS_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-ClaimsTable'
+          ANALYSIS_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-DenialAnalysisTable'
+          PRIORITY_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-PriorityQueueTable'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from decimal import Decimal
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb')
+          CLAIMS_TABLE = os.environ['CLAIMS_TABLE']
+          ANALYSIS_TABLE = os.environ['ANALYSIS_TABLE']
+          PRIORITY_TABLE = os.environ['PRIORITY_TABLE']
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, o):
+                  if isinstance(o, Decimal):
+                      return float(o)
+                  return super().default(o)
+
+          def handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              agent = event.get('agent', {})
+              action_group = event.get('actionGroup', '')
+              api_path = event.get('apiPath', '')
+              parameters = event.get('parameters', [])
+              
+              params = {p['name']: p['value'] for p in parameters}
+              company_id = params.get('companyId', 'default')
+              
+              if api_path == '/claims/by-status':
+                  return query_by_status(company_id, params.get('status', 'APPEAL_GENERATED'))
+              elif api_path == '/claims/by-payer':
+                  return query_by_payer(company_id, params.get('payerId'))
+              elif api_path == '/claims/priority':
+                  return get_priority_queue(company_id)
+              elif api_path == '/claims/{claimId}':
+                  return get_claim(company_id, params.get('claimId'))
+              elif api_path == '/claims/stats':
+                  return get_stats(company_id)
+              
+              return {'statusCode': 404, 'body': 'Action not found'}
+
+          def query_by_status(company_id, status):
+              table = dynamodb.Table(CLAIMS_TABLE)
+              response = table.query(
+                  IndexName='status-index',
+                  KeyConditionExpression='#status = :status',
+                  FilterExpression='companyId = :company',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={
+                      ':status': status,
+                      ':company': company_id
+                  },
+                  Limit=50
+              )
+              return format_response({
+                  'companyId': company_id,
+                  'status': status,
+                  'claims': response.get('Items', []),
+                  'count': len(response.get('Items', []))
+              })
+
+          def query_by_payer(company_id, payer_id):
+              table = dynamodb.Table(CLAIMS_TABLE)
+              response = table.query(
+                  IndexName='payer-index',
+                  KeyConditionExpression='payerId = :payer',
+                  FilterExpression='companyId = :company',
+                  ExpressionAttributeValues={
+                      ':payer': payer_id,
+                      ':company': company_id
+                  },
+                  Limit=50
+              )
+              return format_response({
+                  'companyId': company_id,
+                  'payerId': payer_id,
+                  'claims': response.get('Items', []),
+                  'count': len(response.get('Items', []))
+              })
+
+          def get_priority_queue(company_id):
+              table = dynamodb.Table(PRIORITY_TABLE)
+              response = table.scan(
+                  FilterExpression='companyId = :company',
+                  ExpressionAttributeValues={':company': company_id},
+                  Limit=20
+              )
+              return format_response({
+                  'companyId': company_id,
+                  'priorityQueue': response.get('Items', []),
+                  'count': len(response.get('Items', []))
+              })
+
+          def get_claim(company_id, claim_id):
+              table = dynamodb.Table(CLAIMS_TABLE)
+              response = table.get_item(Key={'claimId': claim_id})
+              item = response.get('Item', {})
+              
+              # Verify company ownership
+              if item and item.get('companyId') != company_id:
+                  return format_response({'error': 'Claim not found or access denied', 'claimId': claim_id})
+              
+              return format_response({
+                  'companyId': company_id,
+                  'claim': item
+              })
+
+          def get_stats(company_id):
+              table = dynamodb.Table(CLAIMS_TABLE)
+              response = table.scan(
+                  FilterExpression='companyId = :company',
+                  ExpressionAttributeValues={':company': company_id},
+                  Select='COUNT'
+              )
+              return format_response({
+                  'companyId': company_id,
+                  'totalClaims': response.get('Count', 0)
+              })
+
+          def format_response(data):
+              return {
+                  'messageVersion': '1.0',
+                  'response': {
+                      'actionGroup': 'ClaimActions',
+                      'apiPath': '/claims',
+                      'httpMethod': 'GET',
+                      'httpStatusCode': 200,
+                      'responseBody': {
+                          'application/json': {
+                              'body': json.dumps(data, cls=DecimalEncoder)
+                          }
+                      }
+                  }
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  QueryClaimsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QueryClaimsFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+
+  # Action Group Lambda - Search Payer Policies (with Multi-Tenant Support)
+  SearchPoliciesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-search-policies'
+      Description: Agent action to search payer policies with company filtering
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt AgentActionLambdaRole.Arn
+      Layers:
+        - !Ref OpenSearchLayerArn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          PAYER_RULES_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucket'
+          EMBEDDING_MODEL_ID: amazon.titan-embed-text-v2:0
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock-runtime')
+          PAYER_RULES_BUCKET = os.environ['PAYER_RULES_BUCKET']
+          OPENSEARCH_ENDPOINT = os.environ['OPENSEARCH_ENDPOINT']
+          EMBEDDING_MODEL_ID = os.environ.get('EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0')
+
+          def handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              parameters = event.get('parameters', [])
+              params = {p['name']: p['value'] for p in parameters}
+              
+              company_id = params.get('companyId', 'default')
+              payer = params.get('payer', '').lower()
+              denial_code = params.get('denialCode', '')
+              cpt_code = params.get('cptCode', '')
+              query = params.get('query', '')
+              
+              # If query provided, do semantic search
+              if query:
+                  return semantic_search(company_id, query, payer, denial_code)
+              
+              # Otherwise, list policies from S3 filtered by company
+              return list_policies(company_id, payer, denial_code, cpt_code)
+
+          def get_embedding(text):
+              """Generate embedding using Amazon Titan"""
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=EMBEDDING_MODEL_ID,
+                      contentType='application/json',
+                      accept='application/json',
+                      body=json.dumps({'inputText': text[:8000]})
+                  )
+                  result = json.loads(response['body'].read())
+                  return result['embedding']
+              except Exception as e:
+                  logger.error(f"Error generating embedding: {str(e)}")
+                  return None
+
+          def semantic_search(company_id, query, payer, denial_code):
+              """Perform semantic search in OpenSearch with company filtering"""
+              try:
+                  from opensearchpy import OpenSearch, RequestsHttpConnection
+                  from requests_aws4auth import AWS4Auth
+                  
+                  region = boto3.session.Session().region_name
+                  credentials = boto3.Session().get_credentials()
+                  awsauth = AWS4Auth(
+                      credentials.access_key,
+                      credentials.secret_key,
+                      region,
+                      'aoss',
+                      session_token=credentials.token
+                  )
+                  
+                  host = OPENSEARCH_ENDPOINT.replace('https://', '')
+                  client = OpenSearch(
+                      hosts=[{'host': host, 'port': 443}],
+                      http_auth=awsauth,
+                      use_ssl=True,
+                      verify_certs=True,
+                      connection_class=RequestsHttpConnection,
+                      timeout=30
+                  )
+                  
+                  # Generate query embedding
+                  query_embedding = get_embedding(query)
+                  if not query_embedding:
+                      return format_response({'error': 'Failed to generate embedding', 'policies': []})
+                  
+                  # Build search query with company filter
+                  filters = [{'term': {'company_id': company_id}}]
+                  if payer:
+                      filters.append({'term': {'payer_id': payer.upper()}})
+                  if denial_code:
+                      filters.append({'term': {'denial_code': denial_code}})
+                  
+                  search_query = {
+                      'size': 10,
+                      'query': {
+                          'bool': {
+                              'must': [
+                                  {
+                                      'knn': {
+                                          'content_vector': {
+                                              'vector': query_embedding,
+                                              'k': 10
+                                          }
+                                      }
+                                  }
+                              ],
+                              'filter': filters
+                          }
+                      },
+                      '_source': {'excludes': ['content_vector']}
+                  }
+                  
+                  response = client.search(index='payer-policies', body=search_query)
+                  hits = response.get('hits', {}).get('hits', [])
+                  
+                  policies = [{
+                      'id': hit['_id'],
+                      'score': hit['_score'],
+                      'payer': hit['_source'].get('payer_id', 'unknown'),
+                      'policyType': hit['_source'].get('policy_type', 'unknown'),
+                      'documentName': hit['_source'].get('document_name', ''),
+                      'content': hit['_source'].get('content_text', '')[:500] + '...'
+                  } for hit in hits]
+                  
+                  return format_response({
+                      'companyId': company_id,
+                      'query': query,
+                      'payer': payer,
+                      'denialCode': denial_code,
+                      'policies': policies,
+                      'totalResults': len(policies),
+                      'searchType': 'semantic'
+                  })
+                  
+              except ImportError:
+                  logger.warning("OpenSearch libraries not available, falling back to S3 search")
+                  return list_policies(company_id, payer, denial_code, '')
+              except Exception as e:
+                  logger.error(f"Semantic search error: {str(e)}")
+                  return list_policies(company_id, payer, denial_code, '')
+
+          def list_policies(company_id, payer, denial_code, cpt_code):
+              """List policies from S3 (fallback when OpenSearch not available)"""
+              policies = []
+              try:
+                  # Build prefix based on company and payer
+                  prefix = f'payer-rules/{payer.upper()}/' if payer else 'payer-rules/'
+                  
+                  response = s3.list_objects_v2(
+                      Bucket=PAYER_RULES_BUCKET,
+                      Prefix=prefix
+                  )
+                  
+                  for obj in response.get('Contents', [])[:20]:
+                      key = obj['Key']
+                      if key.endswith('.pdf') or key.endswith('.json'):
+                          parts = key.split('/')
+                          policies.append({
+                              'key': key,
+                              'payer': parts[1] if len(parts) > 1 else 'unknown',
+                              'documentName': parts[-1] if parts else key,
+                              'lastModified': obj['LastModified'].isoformat(),
+                              'size': obj['Size']
+                          })
+              except Exception as e:
+                  logger.error(f"S3 list error: {str(e)}")
+                  return format_response({'error': str(e), 'policies': []})
+              
+              return format_response({
+                  'companyId': company_id,
+                  'payer': payer,
+                  'denialCode': denial_code,
+                  'cptCode': cpt_code,
+                  'policies': policies,
+                  'totalResults': len(policies),
+                  'searchType': 's3_list',
+                  'recommendation': f'Found {len(policies)} policies for {payer or "all payers"}'
+              })
+
+          def format_response(data):
+              return {
+                  'messageVersion': '1.0',
+                  'response': {
+                      'actionGroup': 'PolicyActions',
+                      'apiPath': '/policies/search',
+                      'httpMethod': 'GET',
+                      'httpStatusCode': 200,
+                      'responseBody': {
+                          'application/json': {
+                              'body': json.dumps(data)
+                          }
+                      }
+                  }
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SearchPoliciesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SearchPoliciesFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # Action Group Lambda - Calculate Appeal Priority
+  CalculatePriorityFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-calculate-priority'
+      Description: Agent action to calculate appeal priority score
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt AgentActionLambdaRole.Arn
+      Environment:
+        Variables:
+          CLAIMS_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-ClaimsTable'
+          OUTCOMES_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTable'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          CLAIMS_TABLE = os.environ['CLAIMS_TABLE']
+          OUTCOMES_TABLE = os.environ['OUTCOMES_TABLE']
+
+          def handler(event, context):
+              parameters = event.get('parameters', [])
+              params = {p['name']: p['value'] for p in parameters}
+              
+              claim_amount = float(params.get('claimAmount', 0))
+              denial_code = params.get('denialCode', '')
+              payer = params.get('payer', '')
+              days_to_deadline = int(params.get('daysToDeadline', 30))
+              
+              # Calculate priority score (1-100)
+              base_score = min(claim_amount / 100, 40)  # Up to 40 points for amount
+              urgency_score = max(0, 30 - days_to_deadline)  # Up to 30 points for urgency
+              
+              # Historical success rate lookup
+              success_rate = get_historical_success_rate(payer, denial_code)
+              success_score = success_rate * 0.3  # Up to 30 points
+              
+              total_score = min(100, base_score + urgency_score + success_score)
+              
+              return format_response({
+                  'priorityScore': round(total_score, 2),
+                  'claimAmount': claim_amount,
+                  'expectedRecovery': round(claim_amount * (success_rate / 100), 2),
+                  'successProbability': success_rate,
+                  'urgencyLevel': 'HIGH' if days_to_deadline < 7 else 'MEDIUM' if days_to_deadline < 30 else 'LOW',
+                  'recommendation': get_recommendation(total_score)
+              })
+
+          def get_historical_success_rate(payer, denial_code):
+              # Default rates by denial code category
+              rates = {
+                  'CO-4': 75, 'CO-16': 65, 'CO-18': 80,
+                  'CO-45': 55, 'CO-50': 70, 'CO-97': 60,
+                  'PR-1': 45, 'PR-2': 50, 'PR-3': 40
+              }
+              return rates.get(denial_code, 60)
+
+          def get_recommendation(score):
+              if score >= 80:
+                  return 'IMMEDIATE_APPEAL - High value, high probability'
+              elif score >= 60:
+                  return 'PRIORITY_APPEAL - Good recovery opportunity'
+              elif score >= 40:
+                  return 'STANDARD_APPEAL - Moderate priority'
+              else:
+                  return 'REVIEW_FIRST - Evaluate before appealing'
+
+          def format_response(data):
+              return {
+                  'messageVersion': '1.0',
+                  'response': {
+                      'actionGroup': 'PriorityActions',
+                      'apiPath': '/priority/calculate',
+                      'httpMethod': 'POST',
+                      'httpStatusCode': 200,
+                      'responseBody': {
+                          'application/json': {
+                              'body': json.dumps(data)
+                          }
+                      }
+                  }
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CalculatePriorityPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CalculatePriorityFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch Index Manager Lambda (Multi-Tenant Support)
+  # ---------------------------------------------------------------------------
+  OpenSearchManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-opensearch-manager-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OpenSearchManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-CompaniesTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableArn'
+                  - !Sub 
+                    - '${TableArn}/index/*'
+                    - TableArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableArn'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+
+  OpenSearchIndexManagerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OpenSearchCollection
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-opensearch-manager'
+      Description: Manages OpenSearch indexes and document ingestion with multi-tenant support
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt OpenSearchManagerRole.Arn
+      Layers:
+        - !Ref OpenSearchLayerArn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          COMPANIES_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-CompaniesTable'
+          PAYER_RULES_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucket'
+          EMBEDDING_MODEL_ID: amazon.titan-embed-text-v2:0
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+          import hashlib
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Environment variables
+          OPENSEARCH_ENDPOINT = os.environ['OPENSEARCH_ENDPOINT']
+          COMPANIES_TABLE = os.environ['COMPANIES_TABLE']
+          PAYER_RULES_BUCKET = os.environ['PAYER_RULES_BUCKET']
+          EMBEDDING_MODEL_ID = os.environ.get('EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0')
+
+          # AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock-runtime')
+          region = boto3.session.Session().region_name
+          credentials = boto3.Session().get_credentials()
+
+          # OpenSearch client
+          awsauth = AWS4Auth(
+              credentials.access_key,
+              credentials.secret_key,
+              region,
+              'aoss',
+              session_token=credentials.token
+          )
+
+          def get_opensearch_client():
+              host = OPENSEARCH_ENDPOINT.replace('https://', '')
+              return OpenSearch(
+                  hosts=[{'host': host, 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection,
+                  timeout=300
+              )
+
+          def handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              action = event.get('action', 'create_indexes')
+              company_id = event.get('companyId')
+              
+              if action == 'create_indexes':
+                  return create_indexes()
+              elif action == 'ingest_documents':
+                  return ingest_documents(company_id, event.get('documents', []))
+              elif action == 'ingest_from_s3':
+                  return ingest_from_s3(company_id, event.get('prefix', ''))
+              elif action == 'search':
+                  return search_documents(company_id, event.get('query', ''), event.get('index', 'payer-policies'))
+              elif action == 'register_company':
+                  return register_company(company_id, event.get('companyName', ''))
+              elif action == 'list_companies':
+                  return list_companies()
+              else:
+                  return {'statusCode': 400, 'body': f'Unknown action: {action}'}
+
+          def create_indexes():
+              """Create OpenSearch indexes with proper mappings for vector search"""
+              client = get_opensearch_client()
+              
+              indexes = {
+                  'payer-policies': {
+                      'settings': {
+                          'index': {
+                              'knn': True,
+                              'knn.algo_param.ef_search': 512
+                          }
+                      },
+                      'mappings': {
+                          'properties': {
+                              'company_id': {'type': 'keyword'},
+                              'payer_id': {'type': 'keyword'},
+                              'policy_type': {'type': 'keyword'},
+                              'document_name': {'type': 'text'},
+                              'content_text': {'type': 'text'},
+                              'content_vector': {
+                                  'type': 'knn_vector',
+                                  'dimension': 1536,
+                                  'method': {
+                                      'name': 'hnsw',
+                                      'space_type': 'cosinesimil',
+                                      'engine': 'nmslib',
+                                      'parameters': {'ef_construction': 512, 'm': 16}
+                                  }
+                              },
+                              's3_key': {'type': 'keyword'},
+                              'created_at': {'type': 'date'},
+                              'updated_at': {'type': 'date'}
+                          }
+                      }
+                  },
+                  'claims-history': {
+                      'settings': {
+                          'index': {
+                              'knn': True,
+                              'knn.algo_param.ef_search': 512
+                          }
+                      },
+                      'mappings': {
+                          'properties': {
+                              'company_id': {'type': 'keyword'},
+                              'claim_id': {'type': 'keyword'},
+                              'payer_id': {'type': 'keyword'},
+                              'denial_code': {'type': 'keyword'},
+                              'denial_reason': {'type': 'text'},
+                              'outcome': {'type': 'keyword'},
+                              'appeal_strategy': {'type': 'text'},
+                              'content_vector': {
+                                  'type': 'knn_vector',
+                                  'dimension': 1536,
+                                  'method': {
+                                      'name': 'hnsw',
+                                      'space_type': 'cosinesimil',
+                                      'engine': 'nmslib',
+                                      'parameters': {'ef_construction': 512, 'm': 16}
+                                  }
+                              },
+                              'created_at': {'type': 'date'},
+                              'success_probability': {'type': 'float'}
+                          }
+                      }
+                  },
+                  'appeal-templates': {
+                      'settings': {
+                          'index': {
+                              'knn': True,
+                              'knn.algo_param.ef_search': 512
+                          }
+                      },
+                      'mappings': {
+                          'properties': {
+                              'company_id': {'type': 'keyword'},
+                              'template_type': {'type': 'keyword'},
+                              'denial_code': {'type': 'keyword'},
+                              'payer_id': {'type': 'keyword'},
+                              'template_name': {'type': 'text'},
+                              'template_content': {'type': 'text'},
+                              'content_vector': {
+                                  'type': 'knn_vector',
+                                  'dimension': 1536,
+                                  'method': {
+                                      'name': 'hnsw',
+                                      'space_type': 'cosinesimil',
+                                      'engine': 'nmslib',
+                                      'parameters': {'ef_construction': 512, 'm': 16}
+                                  }
+                              },
+                              'success_rate': {'type': 'float'},
+                              'created_at': {'type': 'date'}
+                          }
+                      }
+                  }
+              }
+              
+              results = {}
+              for index_name, index_config in indexes.items():
+                  try:
+                      if not client.indices.exists(index=index_name):
+                          client.indices.create(index=index_name, body=index_config)
+                          results[index_name] = 'created'
+                          logger.info(f"Created index: {index_name}")
+                      else:
+                          results[index_name] = 'exists'
+                          logger.info(f"Index already exists: {index_name}")
+                  except Exception as e:
+                      results[index_name] = f'error: {str(e)}'
+                      logger.error(f"Error creating index {index_name}: {str(e)}")
+              
+              return {'statusCode': 200, 'body': json.dumps(results)}
+
+          def get_embedding(text):
+              """Generate embedding using Amazon Titan"""
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=EMBEDDING_MODEL_ID,
+                      contentType='application/json',
+                      accept='application/json',
+                      body=json.dumps({'inputText': text[:8000]})
+                  )
+                  result = json.loads(response['body'].read())
+                  return result['embedding']
+              except Exception as e:
+                  logger.error(f"Error generating embedding: {str(e)}")
+                  return None
+
+          def ingest_documents(company_id, documents):
+              """Ingest documents into OpenSearch with company_id"""
+              if not company_id:
+                  return {'statusCode': 400, 'body': 'company_id is required'}
+              
+              client = get_opensearch_client()
+              results = {'success': 0, 'failed': 0, 'errors': []}
+              
+              for doc in documents:
+                  try:
+                      index_name = doc.get('index', 'payer-policies')
+                      content = doc.get('content', '')
+                      
+                      # Generate embedding
+                      embedding = get_embedding(content)
+                      if not embedding:
+                          results['failed'] += 1
+                          results['errors'].append(f"Failed to generate embedding for {doc.get('id', 'unknown')}")
+                          continue
+                      
+                      # Prepare document (OpenSearch Serverless auto-generates IDs)
+                      document = {
+                          'company_id': company_id,
+                          'content_text': content,
+                          'content_vector': embedding,
+                          'created_at': doc.get('created_at', '2024-01-01T00:00:00Z'),
+                          **{k: v for k, v in doc.items() if k not in ['index', 'content', 'id', 'created_at']}
+                      }
+                      
+                      # Index document (let OpenSearch auto-generate ID)
+                      client.index(index=index_name, body=document)
+                      results['success'] += 1
+                      
+                  except Exception as e:
+                      results['failed'] += 1
+                      results['errors'].append(str(e))
+                      logger.error(f"Error indexing document: {str(e)}")
+              
+              return {'statusCode': 200, 'body': json.dumps(results)}
+
+          def ingest_from_s3(company_id, prefix):
+              """Ingest payer policy documents from S3"""
+              if not company_id:
+                  return {'statusCode': 400, 'body': 'company_id is required'}
+              
+              documents = []
+              try:
+                  response = s3.list_objects_v2(
+                      Bucket=PAYER_RULES_BUCKET,
+                      Prefix=prefix or 'payer-rules/'
+                  )
+                  
+                  for obj in response.get('Contents', []):
+                      key = obj['Key']
+                      if key.endswith('.json'):
+                          # Read JSON policy file
+                          file_response = s3.get_object(Bucket=PAYER_RULES_BUCKET, Key=key)
+                          content = file_response['Body'].read().decode('utf-8')
+                          
+                          # Parse payer info from path
+                          parts = key.split('/')
+                          payer_id = parts[1] if len(parts) > 1 else 'unknown'
+                          
+                          documents.append({
+                              'index': 'payer-policies',
+                              'id': hashlib.md5(key.encode()).hexdigest(),
+                              'content': content,
+                              'payer_id': payer_id,
+                              'policy_type': 'policy_document',
+                              'document_name': key.split('/')[-1],
+                              's3_key': key
+                          })
+                  
+                  # Ingest all documents
+                  return ingest_documents(company_id, documents)
+                  
+              except Exception as e:
+                  logger.error(f"Error ingesting from S3: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def search_documents(company_id, query, index_name):
+              """Search documents with company filtering"""
+              if not company_id:
+                  return {'statusCode': 400, 'body': 'company_id is required'}
+              
+              client = get_opensearch_client()
+              
+              # Generate query embedding
+              query_embedding = get_embedding(query)
+              if not query_embedding:
+                  return {'statusCode': 500, 'body': 'Failed to generate query embedding'}
+              
+              # Build search query with company filter
+              search_query = {
+                  'size': 10,
+                  'query': {
+                      'bool': {
+                          'must': [
+                              {
+                                  'knn': {
+                                      'content_vector': {
+                                          'vector': query_embedding,
+                                          'k': 10
+                                      }
+                                  }
+                              }
+                          ],
+                          'filter': [
+                              {'term': {'company_id': company_id}}
+                          ]
+                      }
+                  },
+                  '_source': {'excludes': ['content_vector']}
+              }
+              
+              try:
+                  response = client.search(index=index_name, body=search_query)
+                  hits = response.get('hits', {}).get('hits', [])
+                  results = [{'id': hit['_id'], 'score': hit['_score'], **hit['_source']} for hit in hits]
+                  return {'statusCode': 200, 'body': json.dumps(results)}
+              except Exception as e:
+                  logger.error(f"Search error: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def register_company(company_id, company_name):
+              """Register a new company in DynamoDB"""
+              if not company_id:
+                  return {'statusCode': 400, 'body': 'company_id is required'}
+              
+              table = dynamodb.Table(COMPANIES_TABLE)
+              from datetime import datetime
+              
+              try:
+                  table.put_item(Item={
+                      'companyId': company_id,
+                      'companyName': company_name or company_id,
+                      'status': 'ACTIVE',
+                      'createdAt': datetime.utcnow().isoformat(),
+                      'settings': {
+                          'maxClaims': 10000,
+                          'enabledFeatures': ['analysis', 'appeal', 'priority']
+                      }
+                  })
+                  return {'statusCode': 200, 'body': json.dumps({'companyId': company_id, 'status': 'registered'})}
+              except Exception as e:
+                  logger.error(f"Error registering company: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+          def list_companies():
+              """List all registered companies"""
+              from decimal import Decimal
+              
+              def decimal_default(obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  raise TypeError
+              
+              table = dynamodb.Table(COMPANIES_TABLE)
+              try:
+                  response = table.scan()
+                  companies = response.get('Items', [])
+                  return {'statusCode': 200, 'body': json.dumps(companies, default=decimal_default)}
+              except Exception as e:
+                  logger.error(f"Error listing companies: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  OpenSearchManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${OpenSearchIndexManagerFunction}'
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # Scheduled OpenSearch Sync (Weekly)
+  # ---------------------------------------------------------------------------
+  OpenSearchSyncScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-opensearch-weekly-sync'
+      Description: Triggers weekly OpenSearch sync to update payer policies from S3
+      ScheduleExpression: 'cron(0 2 ? * SUN *)'  # Every Sunday at 2:00 AM UTC
+      State: ENABLED
+      Targets:
+        - Id: OpenSearchSyncTarget
+          Arn: !GetAtt OpenSearchSyncFunction.Arn
+          Input: !Sub |
+            {
+              "action": "full_sync",
+              "source": "scheduled"
+            }
+
+  OpenSearchSyncPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OpenSearchSyncFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OpenSearchSyncScheduleRule.Arn
+
+  OpenSearchSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-opensearch-sync'
+      Description: Syncs S3 payer policies, DynamoDB claims history, and appeal outcomes to OpenSearch
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 1024
+      Timeout: 900  # 15 minutes for full sync
+      Role: !GetAtt OpenSearchManagerRole.Arn
+      Layers:
+        - !Ref OpenSearchLayerArn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          COMPANIES_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-CompaniesTable'
+          CLAIMS_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-ClaimsTable'
+          APPEAL_OUTCOMES_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTable'
+          PAYER_RULES_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucket'
+          DATA_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-DataBucket'
+          EMBEDDING_MODEL_ID: amazon.titan-embed-text-v2:0
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          import hashlib
+          from decimal import Decimal
+          from datetime import datetime, timedelta
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Environment variables
+          OPENSEARCH_ENDPOINT = os.environ['OPENSEARCH_ENDPOINT']
+          COMPANIES_TABLE = os.environ['COMPANIES_TABLE']
+          CLAIMS_TABLE = os.environ['CLAIMS_TABLE']
+          APPEAL_OUTCOMES_TABLE = os.environ['APPEAL_OUTCOMES_TABLE']
+          PAYER_RULES_BUCKET = os.environ['PAYER_RULES_BUCKET']
+          DATA_BUCKET = os.environ['DATA_BUCKET']
+          EMBEDDING_MODEL_ID = os.environ.get('EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0')
+
+          # AWS clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock-runtime')
+          region = boto3.session.Session().region_name
+          credentials = boto3.Session().get_credentials()
+
+          # OpenSearch auth
+          awsauth = AWS4Auth(
+              credentials.access_key,
+              credentials.secret_key,
+              region,
+              'aoss',
+              session_token=credentials.token
+          )
+
+          def decimal_default(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError
+
+          def get_opensearch_client():
+              host = OPENSEARCH_ENDPOINT.replace('https://', '')
+              return OpenSearch(
+                  hosts=[{'host': host, 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection,
+                  timeout=300
+              )
+
+          def get_embedding(text):
+              """Generate embedding using Amazon Titan"""
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=EMBEDDING_MODEL_ID,
+                      contentType='application/json',
+                      accept='application/json',
+                      body=json.dumps({'inputText': text[:8000]})
+                  )
+                  result = json.loads(response['body'].read())
+                  return result['embedding']
+              except Exception as e:
+                  logger.error(f"Error generating embedding: {str(e)}")
+                  return None
+
+          def handler(event, context):
+              logger.info(f"Received sync event: {json.dumps(event)}")
+              
+              action = event.get('action', 'full_sync')
+              source = event.get('source', 'manual')
+              company_id = event.get('companyId')
+              sync_types = event.get('syncTypes', ['policies', 'claims', 'appeals'])
+              
+              results = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'source': source,
+                  'action': action,
+                  'sync_types': sync_types,
+                  'companies_synced': 0,
+                  'payer_policies': {'processed': 0, 'added': 0, 'updated': 0, 'skipped': 0},
+                  'claims_history': {'processed': 0, 'added': 0, 'updated': 0, 'skipped': 0},
+                  'appeal_outcomes': {'processed': 0, 'added': 0, 'updated': 0, 'skipped': 0},
+                  'errors': []
+              }
+              
+              try:
+                  companies = get_companies(company_id)
+                  results['companies_synced'] = len(companies)
+                  
+                  for company in companies:
+                      cid = company['companyId']
+                      logger.info(f"Syncing company: {cid}")
+                      
+                      # Sync payer policies from S3
+                      if 'policies' in sync_types:
+                          policy_results = sync_payer_policies(cid)
+                          for k in ['processed', 'added', 'updated', 'skipped']:
+                              results['payer_policies'][k] += policy_results[k]
+                          results['errors'].extend(policy_results['errors'])
+                      
+                      # Sync claims history from DynamoDB
+                      if 'claims' in sync_types:
+                          claims_results = sync_claims_history(cid)
+                          for k in ['processed', 'added', 'updated', 'skipped']:
+                              results['claims_history'][k] += claims_results[k]
+                          results['errors'].extend(claims_results['errors'])
+                      
+                      # Sync appeal outcomes from DynamoDB
+                      if 'appeals' in sync_types:
+                          appeals_results = sync_appeal_outcomes(cid)
+                          for k in ['processed', 'added', 'updated', 'skipped']:
+                              results['appeal_outcomes'][k] += appeals_results[k]
+                          results['errors'].extend(appeals_results['errors'])
+                  
+                  log_sync_result(results)
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(results, default=decimal_default)
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Sync failed: {str(e)}")
+                  results['errors'].append(str(e))
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(results, default=decimal_default)
+                  }
+
+          def get_companies(company_id=None):
+              """Get list of active companies"""
+              table = dynamodb.Table(COMPANIES_TABLE)
+              
+              if company_id:
+                  response = table.get_item(Key={'companyId': company_id})
+                  item = response.get('Item')
+                  return [item] if item else []
+              
+              response = table.scan(
+                  FilterExpression='#status = :active',
+                  ExpressionAttributeNames={'#status': 'status'},
+                  ExpressionAttributeValues={':active': 'ACTIVE'}
+              )
+              return response.get('Items', [])
+
+          def sync_payer_policies(company_id):
+              """Sync payer policies from S3 to OpenSearch"""
+              results = {'processed': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'errors': []}
+              client = get_opensearch_client()
+              paginator = s3.get_paginator('list_objects_v2')
+              
+              for prefix in ['payer-rules/', 'payer-rules-json/']:
+                  try:
+                      for page in paginator.paginate(Bucket=PAYER_RULES_BUCKET, Prefix=prefix):
+                          for obj in page.get('Contents', []):
+                              key = obj['Key']
+                              if not key.endswith('.json'):
+                                  continue
+                              
+                              results['processed'] += 1
+                              try:
+                                  last_modified = obj['LastModified'].isoformat()
+                                  existing = check_existing_doc(client, 'payer-policies', company_id, 's3_key', key)
+                                  
+                                  if existing and existing.get('last_modified') == last_modified:
+                                      results['skipped'] += 1
+                                      continue
+                                  
+                                  file_response = s3.get_object(Bucket=PAYER_RULES_BUCKET, Key=key)
+                                  content = file_response['Body'].read().decode('utf-8')
+                                  
+                                  embedding = get_embedding(content)
+                                  if not embedding:
+                                      results['errors'].append(f"Failed embedding for {key}")
+                                      continue
+                                  
+                                  parts = key.split('/')
+                                  payer_id = parts[1] if len(parts) > 1 else 'unknown'
+                                  
+                                  document = {
+                                      'company_id': company_id,
+                                      'payer_id': payer_id,
+                                      'policy_type': 'policy_document',
+                                      'document_name': key.split('/')[-1],
+                                      's3_key': key,
+                                      'content_text': content,
+                                      'content_vector': embedding,
+                                      'last_modified': last_modified,
+                                      'synced_at': datetime.utcnow().isoformat(),
+                                      'created_at': datetime.utcnow().isoformat()
+                                  }
+                                  
+                                  client.index(index='payer-policies', body=document)
+                                  results['updated' if existing else 'added'] += 1
+                                      
+                              except Exception as e:
+                                  results['errors'].append(f"Error processing {key}: {str(e)}")
+                  except Exception as e:
+                      logger.warning(f"Error listing prefix {prefix}: {str(e)}")
+              
+              return results
+
+          def sync_claims_history(company_id):
+              """Sync claims history from DynamoDB to OpenSearch"""
+              results = {'processed': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'errors': []}
+              client = get_opensearch_client()
+              table = dynamodb.Table(CLAIMS_TABLE)
+              
+              try:
+                  # Use high-level Table scan which returns Python dicts
+                  response = table.scan()
+                  items = response.get('Items', [])
+                  
+                  # Handle pagination
+                  while 'LastEvaluatedKey' in response:
+                      response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                      items.extend(response.get('Items', []))
+                  
+                  for item in items:
+                      # Filter by company if companyId exists
+                      item_company = item.get('companyId', 'default')
+                      if company_id != 'default' and item_company != company_id:
+                          continue
+                      
+                      results['processed'] += 1
+                      try:
+                          claim_id = item.get('claimId', '')
+                          if not claim_id:
+                              continue
+                          
+                          # Check if already synced
+                          existing = check_existing_doc(client, 'claims-history', company_id, 'claim_id', claim_id)
+                          
+                          # Build searchable content
+                          denial_reason = item.get('denialReason', '')
+                          denial_code = item.get('denialCode', '')
+                          payer_id = item.get('payerId', '')
+                          status = item.get('status', '')
+                          appeal_strategy = item.get('appealStrategy', '')
+                          outcome = item.get('outcome', '')
+                          
+                          content = f"Claim {claim_id} for payer {payer_id}. Denial code: {denial_code}. Reason: {denial_reason}. Status: {status}. Appeal strategy: {appeal_strategy}. Outcome: {outcome}"
+                          
+                          embedding = get_embedding(content)
+                          if not embedding:
+                              results['errors'].append(f"Failed embedding for claim {claim_id}")
+                              continue
+                          
+                          # Calculate success probability based on outcome
+                          success_prob = 0.0
+                          if outcome in ['APPROVED', 'PAID', 'SUCCESSFUL']:
+                              success_prob = 1.0
+                          elif outcome in ['PARTIAL', 'PARTIALLY_APPROVED']:
+                              success_prob = 0.5
+                          
+                          document = {
+                              'company_id': company_id,
+                              'claim_id': claim_id,
+                              'payer_id': payer_id,
+                              'denial_code': denial_code,
+                              'denial_reason': denial_reason,
+                              'outcome': outcome,
+                              'appeal_strategy': appeal_strategy,
+                              'content_vector': embedding,
+                              'created_at': item.get('createdAt', datetime.utcnow().isoformat()),
+                              'success_probability': success_prob,
+                              'synced_at': datetime.utcnow().isoformat()
+                          }
+                          
+                          client.index(index='claims-history', body=document)
+                          results['updated' if existing else 'added'] += 1
+                          
+                      except Exception as e:
+                          results['errors'].append(f"Error processing claim: {str(e)}")
+                          
+              except Exception as e:
+                  results['errors'].append(f"Error scanning claims table: {str(e)}")
+                  logger.error(f"Error scanning claims: {str(e)}")
+              
+              return results
+
+          def sync_appeal_outcomes(company_id):
+              """Sync appeal outcomes/templates from DynamoDB to OpenSearch"""
+              results = {'processed': 0, 'added': 0, 'updated': 0, 'skipped': 0, 'errors': []}
+              client = get_opensearch_client()
+              table = dynamodb.Table(APPEAL_OUTCOMES_TABLE)
+              
+              try:
+                  # Use high-level Table scan which returns Python dicts
+                  response = table.scan()
+                  items = response.get('Items', [])
+                  
+                  # Handle pagination
+                  while 'LastEvaluatedKey' in response:
+                      response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                      items.extend(response.get('Items', []))
+                  
+                  for item in items:
+                      item_company = item.get('companyId', 'default')
+                      if company_id != 'default' and item_company != company_id:
+                          continue
+                      
+                      results['processed'] += 1
+                      try:
+                          claim_id = item.get('claimId', '')
+                          appeal_id = item.get('appealId', '')
+                          if not claim_id or not appeal_id:
+                              continue
+                          
+                          existing = check_existing_doc(client, 'appeal-templates', company_id, 'claim_id', claim_id)
+                          
+                          # Build searchable content
+                          payer_id = item.get('payerId', '')
+                          denial_code = item.get('denialCode', '')
+                          appeal_letter = item.get('appealLetter', '')
+                          outcome = item.get('outcome', '')
+                          strategy = item.get('strategy', '')
+                          
+                          content = f"Appeal for {payer_id} denial code {denial_code}. Strategy: {strategy}. Letter: {appeal_letter}. Outcome: {outcome}"
+                          
+                          embedding = get_embedding(content)
+                          if not embedding:
+                              results['errors'].append(f"Failed embedding for appeal {appeal_id}")
+                              continue
+                          
+                          # Calculate success rate
+                          success_rate = 0.0
+                          if outcome in ['APPROVED', 'PAID', 'SUCCESSFUL', 'WON']:
+                              success_rate = 1.0
+                          elif outcome in ['PARTIAL', 'PARTIALLY_APPROVED']:
+                              success_rate = 0.5
+                          
+                          document = {
+                              'company_id': company_id,
+                              'claim_id': claim_id,
+                              'appeal_id': appeal_id,
+                              'template_type': 'appeal_outcome',
+                              'denial_code': denial_code,
+                              'payer_id': payer_id,
+                              'template_name': f"Appeal for {denial_code}",
+                              'template_content': appeal_letter,
+                              'content_vector': embedding,
+                              'success_rate': success_rate,
+                              'created_at': item.get('outcomeDate', datetime.utcnow().isoformat()),
+                              'synced_at': datetime.utcnow().isoformat()
+                          }
+                          
+                          client.index(index='appeal-templates', body=document)
+                          results['updated' if existing else 'added'] += 1
+                          
+                      except Exception as e:
+                          results['errors'].append(f"Error processing appeal: {str(e)}")
+                          
+              except Exception as e:
+                  results['errors'].append(f"Error scanning appeals table: {str(e)}")
+                  logger.error(f"Error scanning appeals: {str(e)}")
+              
+              return results
+
+          def check_existing_doc(client, index, company_id, key_field, key_value):
+              """Check if document already exists in OpenSearch"""
+              try:
+                  query = {
+                      'query': {
+                          'bool': {
+                              'must': [
+                                  {'term': {'company_id': company_id}},
+                                  {'term': {key_field: key_value}}
+                              ]
+                          }
+                      },
+                      '_source': ['last_modified', 'synced_at'],
+                      'size': 1
+                  }
+                  response = client.search(index=index, body=query)
+                  hits = response.get('hits', {}).get('hits', [])
+                  if hits:
+                      return hits[0]['_source']
+              except Exception as e:
+                  logger.warning(f"Error checking existing doc: {str(e)}")
+              return None
+
+          def log_sync_result(results):
+              """Log sync results for monitoring"""
+              logger.info(f"Sync completed: {json.dumps(results, default=decimal_default)}")
+              
+              try:
+                  log_key = f"sync-logs/{datetime.utcnow().strftime('%Y/%m/%d')}/sync_{datetime.utcnow().strftime('%H%M%S')}.json"
+                  s3.put_object(
+                      Bucket=DATA_BUCKET,
+                      Key=log_key,
+                      Body=json.dumps(results, indent=2, default=decimal_default),
+                      ContentType='application/json'
+                  )
+              except Exception as e:
+                  logger.warning(f"Failed to store sync log: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  OpenSearchSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${OpenSearchSyncFunction}'
+      RetentionInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # Real-Time OpenSearch Sync (DynamoDB Streams + S3 Events)
+  # ---------------------------------------------------------------------------
+  
+  # Lambda for real-time DynamoDB Stream processing
+  OpenSearchRealtimeSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-opensearch-realtime-sync'
+      Description: Real-time sync from DynamoDB Streams and S3 events to OpenSearch
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt OpenSearchRealtimeSyncRole.Arn
+      Layers:
+        - !Ref OpenSearchLayerArn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+          EMBEDDING_MODEL_ID: amazon.titan-embed-text-v2:0
+          PAYER_RULES_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucket'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+          from decimal import Decimal
+          from datetime import datetime
+          from opensearchpy import OpenSearch, RequestsHttpConnection
+          from requests_aws4auth import AWS4Auth
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          OPENSEARCH_ENDPOINT = os.environ['OPENSEARCH_ENDPOINT']
+          EMBEDDING_MODEL_ID = os.environ.get('EMBEDDING_MODEL_ID', 'amazon.titan-embed-text-v2:0')
+          PAYER_RULES_BUCKET = os.environ.get('PAYER_RULES_BUCKET', '')
+
+          s3 = boto3.client('s3')
+          bedrock = boto3.client('bedrock-runtime')
+          region = boto3.session.Session().region_name
+          credentials = boto3.Session().get_credentials()
+
+          awsauth = AWS4Auth(
+              credentials.access_key,
+              credentials.secret_key,
+              region,
+              'aoss',
+              session_token=credentials.token
+          )
+
+          def get_opensearch_client():
+              host = OPENSEARCH_ENDPOINT.replace('https://', '')
+              return OpenSearch(
+                  hosts=[{'host': host, 'port': 443}],
+                  http_auth=awsauth,
+                  use_ssl=True,
+                  verify_certs=True,
+                  connection_class=RequestsHttpConnection,
+                  timeout=30
+              )
+
+          def get_embedding(text):
+              try:
+                  response = bedrock.invoke_model(
+                      modelId=EMBEDDING_MODEL_ID,
+                      contentType='application/json',
+                      accept='application/json',
+                      body=json.dumps({'inputText': text[:8000]})
+                  )
+                  result = json.loads(response['body'].read())
+                  return result['embedding']
+              except Exception as e:
+                  logger.error(f"Error generating embedding: {str(e)}")
+                  return None
+
+          def decimal_to_float(obj):
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              elif isinstance(obj, dict):
+                  return {k: decimal_to_float(v) for k, v in obj.items()}
+              elif isinstance(obj, list):
+                  return [decimal_to_float(i) for i in obj]
+              return obj
+
+          def handler(event, context):
+              logger.info(f"Received event: {json.dumps(event, default=str)}")
+              
+              results = {'processed': 0, 'added': 0, 'updated': 0, 'deleted': 0, 'errors': []}
+              
+              # Check if this is a DynamoDB Stream event
+              if 'Records' in event:
+                  for record in event['Records']:
+                      # DynamoDB Stream event
+                      if record.get('eventSource') == 'aws:dynamodb':
+                          process_dynamodb_record(record, results)
+                      # S3 event
+                      elif record.get('eventSource') == 'aws:s3':
+                          process_s3_record(record, results)
+              
+              logger.info(f"Sync results: {json.dumps(results)}")
+              return {'statusCode': 200, 'body': json.dumps(results)}
+
+          def process_dynamodb_record(record, results):
+              """Process a single DynamoDB Stream record"""
+              results['processed'] += 1
+              event_name = record.get('eventName', '')
+              
+              try:
+                  client = get_opensearch_client()
+                  
+                  # Determine which table this is from
+                  event_source_arn = record.get('eventSourceARN', '')
+                  
+                  if 'claims' in event_source_arn:
+                      index_name = 'claims-history'
+                      process_claims_record(client, record, event_name, results)
+                  elif 'appeal-outcomes' in event_source_arn:
+                      index_name = 'appeal-templates'
+                      process_appeal_record(client, record, event_name, results)
+                  else:
+                      logger.warning(f"Unknown table source: {event_source_arn}")
+                      
+              except Exception as e:
+                  results['errors'].append(str(e))
+                  logger.error(f"Error processing DynamoDB record: {str(e)}")
+
+          def process_claims_record(client, record, event_name, results):
+              """Process claims table record"""
+              if event_name == 'REMOVE':
+                  # Delete from OpenSearch
+                  old_image = record['dynamodb'].get('OldImage', {})
+                  claim_id = old_image.get('claimId', {}).get('S', '')
+                  if claim_id:
+                      delete_from_opensearch(client, 'claims-history', 'claim_id', claim_id)
+                      results['deleted'] += 1
+              else:
+                  # INSERT or MODIFY - upsert to OpenSearch
+                  new_image = record['dynamodb'].get('NewImage', {})
+                  item = deserialize_dynamodb_item(new_image)
+                  
+                  claim_id = item.get('claimId', '')
+                  if not claim_id:
+                      return
+                  
+                  company_id = item.get('companyId', 'demo-company')
+                  payer_id = item.get('payerId', '')
+                  denial_code = item.get('denialCode', '')
+                  denial_reason = item.get('denialReason', '')
+                  status = item.get('status', '')
+                  appeal_strategy = item.get('appealStrategy', '')
+                  outcome = item.get('outcome', '')
+                  
+                  content = f"Claim {claim_id} for payer {payer_id}. Denial code: {denial_code}. Reason: {denial_reason}. Status: {status}. Appeal strategy: {appeal_strategy}. Outcome: {outcome}"
+                  
+                  embedding = get_embedding(content)
+                  if not embedding:
+                      results['errors'].append(f"Failed embedding for claim {claim_id}")
+                      return
+                  
+                  success_prob = 0.0
+                  if outcome in ['APPROVED', 'PAID', 'SUCCESSFUL']:
+                      success_prob = 1.0
+                  elif outcome in ['PARTIAL', 'PARTIALLY_APPROVED']:
+                      success_prob = 0.5
+                  
+                  document = {
+                      'company_id': company_id,
+                      'claim_id': claim_id,
+                      'payer_id': payer_id,
+                      'denial_code': denial_code,
+                      'denial_reason': denial_reason,
+                      'outcome': outcome,
+                      'appeal_strategy': appeal_strategy,
+                      'content_vector': embedding,
+                      'created_at': item.get('createdAt', datetime.utcnow().isoformat()),
+                      'success_probability': success_prob,
+                      'synced_at': datetime.utcnow().isoformat()
+                  }
+                  
+                  client.index(index='claims-history', body=document)
+                  results['added' if event_name == 'INSERT' else 'updated'] += 1
+
+          def process_appeal_record(client, record, event_name, results):
+              """Process appeal outcomes table record"""
+              if event_name == 'REMOVE':
+                  old_image = record['dynamodb'].get('OldImage', {})
+                  claim_id = old_image.get('claimId', {}).get('S', '')
+                  if claim_id:
+                      delete_from_opensearch(client, 'appeal-templates', 'claim_id', claim_id)
+                      results['deleted'] += 1
+              else:
+                  new_image = record['dynamodb'].get('NewImage', {})
+                  item = deserialize_dynamodb_item(new_image)
+                  
+                  claim_id = item.get('claimId', '')
+                  appeal_id = item.get('appealId', '')
+                  if not claim_id or not appeal_id:
+                      return
+                  
+                  company_id = item.get('companyId', 'demo-company')
+                  payer_id = item.get('payerId', '')
+                  denial_code = item.get('denialCode', '')
+                  appeal_letter = item.get('appealLetter', '')
+                  outcome = item.get('outcome', '')
+                  strategy = item.get('strategy', '')
+                  
+                  content = f"Appeal for {payer_id} denial code {denial_code}. Strategy: {strategy}. Letter: {appeal_letter}. Outcome: {outcome}"
+                  
+                  embedding = get_embedding(content)
+                  if not embedding:
+                      results['errors'].append(f"Failed embedding for appeal {appeal_id}")
+                      return
+                  
+                  success_rate = 0.0
+                  if outcome in ['APPROVED', 'PAID', 'SUCCESSFUL', 'WON']:
+                      success_rate = 1.0
+                  elif outcome in ['PARTIAL', 'PARTIALLY_APPROVED']:
+                      success_rate = 0.5
+                  
+                  document = {
+                      'company_id': company_id,
+                      'claim_id': claim_id,
+                      'appeal_id': appeal_id,
+                      'template_type': 'appeal_outcome',
+                      'denial_code': denial_code,
+                      'payer_id': payer_id,
+                      'template_name': f"Appeal for {denial_code}",
+                      'template_content': appeal_letter,
+                      'content_vector': embedding,
+                      'success_rate': success_rate,
+                      'created_at': item.get('outcomeDate', datetime.utcnow().isoformat()),
+                      'synced_at': datetime.utcnow().isoformat()
+                  }
+                  
+                  client.index(index='appeal-templates', body=document)
+                  results['added' if event_name == 'INSERT' else 'updated'] += 1
+
+          def process_s3_record(record, results):
+              """Process S3 event record for payer policies"""
+              results['processed'] += 1
+              
+              try:
+                  client = get_opensearch_client()
+                  event_name = record.get('eventName', '')
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+                  
+                  # Only process JSON files in payer-rules folders
+                  if not key.endswith('.json') or 'payer-rules' not in key:
+                      return
+                  
+                  if 'ObjectRemoved' in event_name:
+                      delete_from_opensearch(client, 'payer-policies', 's3_key', key)
+                      results['deleted'] += 1
+                  else:
+                      # ObjectCreated - index the document
+                      file_response = s3.get_object(Bucket=bucket, Key=key)
+                      content = file_response['Body'].read().decode('utf-8')
+                      
+                      embedding = get_embedding(content)
+                      if not embedding:
+                          results['errors'].append(f"Failed embedding for {key}")
+                          return
+                      
+                      parts = key.split('/')
+                      payer_id = parts[1] if len(parts) > 1 else 'unknown'
+                      
+                      document = {
+                          'company_id': 'demo-company',
+                          'payer_id': payer_id,
+                          'policy_type': 'policy_document',
+                          'document_name': key.split('/')[-1],
+                          's3_key': key,
+                          'content_text': content,
+                          'content_vector': embedding,
+                          'last_modified': datetime.utcnow().isoformat(),
+                          'synced_at': datetime.utcnow().isoformat(),
+                          'created_at': datetime.utcnow().isoformat()
+                      }
+                      
+                      client.index(index='payer-policies', body=document)
+                      results['added'] += 1
+                      
+              except Exception as e:
+                  results['errors'].append(str(e))
+                  logger.error(f"Error processing S3 record: {str(e)}")
+
+          def deserialize_dynamodb_item(item):
+              """Convert DynamoDB item format to regular dict"""
+              result = {}
+              for key, value in item.items():
+                  if 'S' in value:
+                      result[key] = value['S']
+                  elif 'N' in value:
+                      result[key] = Decimal(value['N'])
+                  elif 'BOOL' in value:
+                      result[key] = value['BOOL']
+                  elif 'M' in value:
+                      result[key] = deserialize_dynamodb_item(value['M'])
+                  elif 'L' in value:
+                      result[key] = [deserialize_dynamodb_item({'item': v})['item'] if isinstance(v, dict) else v for v in value['L']]
+                  elif 'NULL' in value:
+                      result[key] = None
+              return result
+
+          def delete_from_opensearch(client, index, key_field, key_value):
+              """Delete document from OpenSearch by key"""
+              try:
+                  query = {
+                      'query': {
+                          'term': {key_field: key_value}
+                      }
+                  }
+                  client.delete_by_query(index=index, body=query)
+              except Exception as e:
+                  logger.warning(f"Error deleting from OpenSearch: {str(e)}")
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  OpenSearchRealtimeSyncLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${OpenSearchRealtimeSyncFunction}'
+      RetentionInDays: 30
+
+  # IAM Role for real-time sync Lambda
+  OpenSearchRealtimeSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-opensearch-realtime-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OpenSearchRealtimeSyncPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableStreamArn'
+                  - Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableStreamArn'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+
+  # DynamoDB Stream Event Source Mapping - Claims Table
+  ClaimsStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableStreamArn'
+      FunctionName: !GetAtt OpenSearchRealtimeSyncFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # DynamoDB Stream Event Source Mapping - Appeal Outcomes Table
+  AppealOutcomesStreamEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::ImportValue: !Sub '${DataStackName}-AppealOutcomesTableStreamArn'
+      FunctionName: !GetAtt OpenSearchRealtimeSyncFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # S3 Event Permission for Lambda
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OpenSearchRealtimeSyncFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn:
+        Fn::ImportValue: !Sub '${DataStackName}-PayerRulesBucketArn'
+
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  OpenSearchCollectionEndpoint:
+    Description: OpenSearch Serverless collection endpoint
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchEndpoint'
+
+  OpenSearchCollectionArn:
+    Description: OpenSearch Serverless collection ARN
+    Value: !GetAtt OpenSearchCollection.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchArn'
+
+  BedrockAgentRoleArn:
+    Description: ARN of the Bedrock Agent IAM role
+    Value: !GetAtt BedrockAgentRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentRoleArn'
+
+  KnowledgeBaseRoleArn:
+    Description: ARN of the Knowledge Base IAM role
+    Value: !GetAtt KnowledgeBaseRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KBRoleArn'
+
+  QueryClaimsFunctionArn:
+    Description: ARN of the Query Claims Lambda
+    Value: !GetAtt QueryClaimsFunction.Arn
+
+  SearchPoliciesFunctionArn:
+    Description: ARN of the Search Policies Lambda
+    Value: !GetAtt SearchPoliciesFunction.Arn
+
+  CalculatePriorityFunctionArn:
+    Description: ARN of the Calculate Priority Lambda
+    Value: !GetAtt CalculatePriorityFunction.Arn
+
+  OpenSearchIndexManagerFunctionArn:
+    Description: ARN of the OpenSearch Index Manager Lambda
+    Value: !GetAtt OpenSearchIndexManagerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-OpenSearchManagerArn'
+
+  OpenSearchIndexManagerFunctionName:
+    Description: Name of the OpenSearch Index Manager Lambda
+    Value: !Ref OpenSearchIndexManagerFunction
+
+  OpenSearchSyncFunctionArn:
+    Description: ARN of the OpenSearch Sync Lambda
+    Value: !GetAtt OpenSearchSyncFunction.Arn
+
+  OpenSearchSyncFunctionName:
+    Description: Name of the OpenSearch Sync Lambda
+    Value: !Ref OpenSearchSyncFunction
+
+  OpenSearchSyncSchedule:
+    Description: Schedule for OpenSearch sync (cron expression)
+    Value: 'Every Sunday at 2:00 AM UTC (cron: 0 2 ? * SUN *)'
+
+  OpenSearchRealtimeSyncFunctionArn:
+    Description: ARN of the OpenSearch Real-time Sync Lambda
+    Value: !GetAtt OpenSearchRealtimeSyncFunction.Arn
+
+  OpenSearchRealtimeSyncFunctionName:
+    Description: Name of the OpenSearch Real-time Sync Lambda
+    Value: !Ref OpenSearchRealtimeSyncFunction
+
+  RealtimeSyncInfo:
+    Description: Real-time sync configuration
+    Value: |
+      Real-time sync is enabled for:
+      - DynamoDB Claims table (via Streams)
+      - DynamoDB Appeal Outcomes table (via Streams)
+      - S3 Payer Rules bucket (via S3 Events - requires manual bucket notification setup)
+
+  BedrockAgentInstructions:
+    Description: Instructions to create Bedrock Agent manually
+    Value: |
+      Create Bedrock Agent in AWS Console with:
+      1. Agent Name: denialrecover-agent
+      2. Model: Claude 3 Sonnet
+      3. Instructions: You are a medical claim denial recovery specialist. 
+         Help users analyze denied claims, find relevant payer policies, 
+         calculate appeal priority, and generate appeal recommendations.
+      4. Action Groups:
+         - ClaimActions: Query claims by status, payer, or ID
+         - PolicyActions: Search payer policies
+         - PriorityActions: Calculate appeal priority scores
+      5. Knowledge Base: Connect to OpenSearch collection for RAG

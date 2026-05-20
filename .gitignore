@@ -1,0 +1,22 @@
+# Lambda layers (large binaries)
+lambda-layers/
+
+# Sample data PDFs (regenerate with generate_all_docs.py)
+MVP_FLOW/SAMPLE_DATA/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp files
+*.zip
+*.tmp
+
+# Kiro
+.kiro/

@@ -1,0 +1,427 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DenialRecover AI - SharePoint to S3 Sync (Power Automate Integration)'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: denialrecover
+  DataStackName:
+    Type: String
+    Default: denialrecover-dev
+    Description: Name of the data stack to import S3 bucket
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # API Gateway - REST API for SharePoint Upload
+  # ---------------------------------------------------------------------------
+  SharePointSyncApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-sharepoint-sync'
+      Description: API for Power Automate to upload files from SharePoint to S3
+      BinaryMediaTypes:
+        - 'application/pdf'
+        - 'image/png'
+        - 'image/jpeg'
+        - 'image/tiff'
+        - 'application/octet-stream'
+
+  # /upload resource
+  UploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+      ParentId: !GetAtt SharePointSyncApi.RootResourceId
+      PathPart: upload
+
+  # /upload/presigned-url resource
+  PresignedUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+      ParentId: !Ref UploadResource
+      PathPart: presigned-url
+
+  # POST /upload/presigned-url - Get pre-signed URL for upload
+  PresignedUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+      ResourceId: !Ref PresignedUrlResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PresignedUrlFunction.Arn}/invocations'
+
+  # /upload/direct resource
+  DirectUploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+      ParentId: !Ref UploadResource
+      PathPart: direct
+
+  # POST /upload/direct - Direct file upload via API Gateway
+  DirectUploadMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+      ResourceId: !Ref DirectUploadResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DirectUploadFunction.Arn}/invocations'
+
+  # API Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PresignedUrlMethod
+      - DirectUploadMethod
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+
+  # API Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref SharePointSyncApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      Description: !Sub '${Environment} stage'
+
+  # API Key for Power Automate authentication
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-sharepoint-api-key'
+      Description: API Key for Power Automate SharePoint sync
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref SharePointSyncApi
+          StageName: !Ref Environment
+
+  # Usage Plan
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-${Environment}-sharepoint-plan'
+      Description: Usage plan for SharePoint sync
+      ApiStages:
+        - ApiId: !Ref SharePointSyncApi
+          Stage: !Ref Environment
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 20
+      Quota:
+        Limit: 10000
+        Period: DAY
+
+  # Link API Key to Usage Plan
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # ---------------------------------------------------------------------------
+  # IAM Role for Lambda Functions
+  # ---------------------------------------------------------------------------
+  SharePointSyncLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-sharepoint-sync-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3UploadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-KMSKey'
+
+  # ---------------------------------------------------------------------------
+  # Lambda - Generate Pre-signed URL
+  # ---------------------------------------------------------------------------
+  PresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-presigned-url'
+      Description: Generates pre-signed S3 URLs for Power Automate file uploads
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt SharePointSyncLambdaRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-DataBucket'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel('INFO')
+
+          s3 = boto3.client('s3')
+          BUCKET = os.environ['DATA_BUCKET']
+
+          def handler(event, context):
+              """Generate a pre-signed URL for uploading a file to S3.
+              
+              Expected body:
+              {
+                "fileName": "denied_claim_CLM001.pdf",
+                "folderPath": "intake/claims/PAT001_john_smith/",
+                "contentType": "application/pdf"
+              }
+              """
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  file_name = body.get('fileName', '')
+                  folder_path = body.get('folderPath', '').strip('/')
+                  content_type = body.get('contentType', 'application/pdf')
+                  
+                  if not file_name or not folder_path:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({'error': 'fileName and folderPath are required'})
+                      }
+                  
+                  # Build S3 key
+                  s3_key = f"{folder_path}/{file_name}"
+                  
+                  # Generate pre-signed URL (valid for 5 minutes)
+                  presigned_url = s3.generate_presigned_url(
+                      'put_object',
+                      Params={
+                          'Bucket': BUCKET,
+                          'Key': s3_key,
+                          'ContentType': content_type
+                      },
+                      ExpiresIn=300
+                  )
+                  
+                  logger.info(f"Generated pre-signed URL for: s3://{BUCKET}/{s3_key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({
+                          'uploadUrl': presigned_url,
+                          's3Key': s3_key,
+                          'bucket': BUCKET,
+                          'expiresIn': 300
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  PresignedUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PresignedUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SharePointSyncApi}/*'
+
+  # ---------------------------------------------------------------------------
+  # Lambda - Direct Upload (base64 encoded file in body)
+  # ---------------------------------------------------------------------------
+  DirectUploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-direct-upload'
+      Description: Receives file content directly from Power Automate and uploads to S3
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 512
+      Timeout: 30
+      Role: !GetAtt SharePointSyncLambdaRole.Arn
+      Environment:
+        Variables:
+          DATA_BUCKET:
+            Fn::ImportValue: !Sub '${DataStackName}-DataBucket'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          import base64
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel('INFO')
+
+          s3 = boto3.client('s3')
+          BUCKET = os.environ['DATA_BUCKET']
+
+          def handler(event, context):
+              """Upload file directly from Power Automate.
+              
+              Expected body (JSON):
+              {
+                "fileName": "denied_claim_CLM001.pdf",
+                "folderPath": "/DenialRecover_AI/intake/claims/PAT001_john_smith/",
+                "fileContent": "<base64 encoded file content>",
+                "contentType": "application/pdf"
+              }
+              """
+              try:
+                  # Handle both base64 encoded body and JSON body
+                  if event.get('isBase64Encoded'):
+                      body = json.loads(base64.b64decode(event['body']))
+                  else:
+                      body = json.loads(event.get('body', '{}'))
+                  
+                  file_name = body.get('fileName', '')
+                  folder_path = body.get('folderPath', '').strip('/')
+                  file_content_b64 = body.get('fileContent', '')
+                  content_type = body.get('contentType', 'application/pdf')
+                  
+                  if not file_name or not folder_path or not file_content_b64:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({'error': 'fileName, folderPath, and fileContent are required'})
+                      }
+                  
+                  # Strip SharePoint library prefix to get S3-compatible path
+                  # e.g. "/DenialRecover_AI/intake/claims/PAT001" -> "intake/claims/PAT001"
+                  if 'DenialRecover_AI/' in folder_path:
+                      folder_path = folder_path.split('DenialRecover_AI/', 1)[1]
+                  # Also handle "Shared Documents/DenialRecover_AI/" prefix
+                  if 'Shared Documents/' in folder_path:
+                      folder_path = folder_path.split('Shared Documents/', 1)[1]
+                      if folder_path.startswith('DenialRecover_AI/'):
+                          folder_path = folder_path[len('DenialRecover_AI/'):]
+                  
+                  folder_path = folder_path.strip('/')
+                  
+                  # Decode base64 file content
+                  file_bytes = base64.b64decode(file_content_b64)
+                  
+                  # Build S3 key
+                  s3_key = f"{folder_path}/{file_name}"
+                  
+                  # Upload to S3
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key=s3_key,
+                      Body=file_bytes,
+                      ContentType=content_type
+                  )
+                  
+                  logger.info(f"Uploaded: s3://{BUCKET}/{s3_key} ({len(file_bytes)} bytes)")
+                  
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({
+                          'message': 'File uploaded successfully',
+                          's3Key': s3_key,
+                          'bucket': BUCKET,
+                          'fileSize': len(file_bytes)
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  DirectUploadPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DirectUploadFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SharePointSyncApi}/*'
+
+  # ---------------------------------------------------------------------------
+  # Log Groups
+  # ---------------------------------------------------------------------------
+  PresignedUrlLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${PresignedUrlFunction}'
+      RetentionInDays: 30
+
+  DirectUploadLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${DirectUploadFunction}'
+      RetentionInDays: 30
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL for Power Automate
+    Value: !Sub 'https://${SharePointSyncApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  PresignedUrlEndpoint:
+    Description: POST endpoint to get pre-signed upload URL
+    Value: !Sub 'https://${SharePointSyncApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/upload/presigned-url'
+
+  DirectUploadEndpoint:
+    Description: POST endpoint for direct file upload (base64)
+    Value: !Sub 'https://${SharePointSyncApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/upload/direct'
+
+  ApiKeyId:
+    Description: API Key ID (retrieve value from AWS Console)
+    Value: !Ref ApiKey
+
+  PowerAutomateInstructions:
+    Description: Instructions for Power Automate setup
+    Value: |
+      1. Create a Power Automate flow triggered by "When a file is created in a folder" (SharePoint)
+      2. Set the SharePoint site and folder to your DenialRecover_AI document library
+      3. Add an HTTP action: POST to the DirectUploadEndpoint
+      4. Headers: x-api-key = (your API key value), Content-Type = application/json
+      5. Body: {"fileName": "@{triggerOutputs()?['body/{Name}']}", "folderPath": "intake/claims/PAT001_patient_name/", "fileContent": "@{base64(triggerOutputs()?['body/$content'])}", "contentType": "application/pdf"}
