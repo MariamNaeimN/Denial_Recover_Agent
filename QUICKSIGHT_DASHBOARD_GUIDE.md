@@ -1,5 +1,36 @@
 # QuickSight Dashboard Guide — DenialRecover AI
 
+## Public Dashboard
+
+| Property | Value |
+|----------|-------|
+| **Public URL** | `https://d32s2hn1a29hfl.cloudfront.net` |
+| **Dashboard ID** | `4ce46504-95bf-4ad4-a34d-025e808ee0ea` |
+| **Embedding** | Registered user (via Lambda + API Gateway) |
+| **CloudFront** | `E7MMDKP4YTENI` |
+| **WebSocket** | `wss://i9ixftt1yb.execute-api.us-east-1.amazonaws.com/prod` |
+| **Data Mode** | Direct Query to Redshift (live) |
+
+### How Public Access Works
+
+```
+User opens CloudFront URL
+    │
+    ▼
+Static HTML loads from S3 (index.html)
+    │
+    ├── Fetches /api/embed-url (via CloudFront → API Gateway → Lambda)
+    │       └── Lambda calls quicksight:GenerateEmbedUrlForRegisteredUser
+    │       └── Returns signed embed URL (valid 10 hours)
+    │
+    ├── Loads QuickSight iframe with embed URL
+    │
+    └── Connects WebSocket for real-time updates
+            └── DynamoDB Streams → Lambda → Push to all connected clients
+```
+
+---
+
 ## Dataset
 
 Use this custom SQL query (Direct Query mode):
@@ -21,6 +52,7 @@ SELECT
     c.appeal_deadline,
     c.created_at,
     c.updated_at,
+    c.appeal_pdf_url,
     dt.claim_count AS denial_trend_count,
     dt.total_amount AS denial_trend_total,
     dt.avg_success_rate AS denial_trend_avg_rate,
@@ -166,8 +198,6 @@ ORDER BY c.expected_recovery DESC
 - Value: `claim_id` → Aggregation: **Count**
 - Sort: By value, descending
 
-**Note:** If payer shows "unknown", that's because payer data isn't stored at the top level in DynamoDB yet. This will improve as more data flows through.
-
 **What it tells you:** "Payer X is denying the most claims — we need to review their rules."
 
 ---
@@ -199,11 +229,13 @@ ORDER BY c.expected_recovery DESC
 - Columns (in order):
   1. `claim_id`
   2. `patient_name`
-  3. `denial_code`
-  4. `claim_amount` (format: currency)
-  5. `success_probability` (format: number + % suffix)
-  6. `expected_recovery` (format: currency)
-  7. `recovery_opportunity`
+  3. `payer`
+  4. `denial_code`
+  5. `claim_amount` (format: currency)
+  6. `success_probability` (format: number + % suffix)
+  7. `expected_recovery` (format: currency)
+  8. `recovery_opportunity`
+  9. `appeal_pdf_url` (hyperlink)
 - Sort: `expected_recovery` descending
 - Conditional formatting:
   - `recovery_opportunity` = HIGH → green background
@@ -296,3 +328,19 @@ ORDER BY c.expected_recovery DESC
 - Use conditional formatting (green/yellow/red) on `recovery_opportunity`
 - All data refreshes live from Redshift (Direct Query mode)
 - Redshift syncs from DynamoDB every hour automatically
+- Real-time toast notifications appear on the public dashboard via WebSocket
+- The `appeal_pdf_url` column can be configured as a hyperlink in the table visual
+- Dashboard is publicly accessible at `https://d32s2hn1a29hfl.cloudfront.net`
+
+---
+
+## Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| Dashboard shows "Unable to load" | Check Lambda logs: `/aws/lambda/denialrecover-dev-embed-url` |
+| Charts show "error querying data" | Run manual sync: `aws lambda invoke --function-name denialrecover-dev-data-sync` |
+| WebSocket shows "Offline" | Check Lambda logs: `/aws/lambda/denialrecover-dev-ws-connect` |
+| Embed URL 403 | Ensure QuickSight user ARN matches the one in Lambda env var |
+| No data in charts | Verify Redshift has data: `SELECT COUNT(*) FROM claims;` |
+| CloudFront returns old page | Invalidate cache: `aws cloudfront create-invalidation --distribution-id E7MMDKP4YTENI --paths "/*"` |

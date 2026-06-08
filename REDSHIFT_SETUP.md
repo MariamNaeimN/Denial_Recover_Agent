@@ -7,21 +7,21 @@
 | **Workgroup** | `denialrecover-dev-workgroup` |
 | **Database** | `denialrecover` |
 | **Admin User** | `admin` |
-| **Admin Password** | `DenialRecover2024!` |
 | **Region** | `us-east-1` |
-| **VPC** | `vpc-0f59e6a70abf16538` (market-intelligence-vpc-dev) |
-| **Publicly Accessible** | Yes |
+| **VPC** | `vpc-0f59e6a70abf16538` |
+| **Publicly Accessible** | No (internal VPC only) |
+| **Base Capacity** | 32 RPU |
 
 ---
 
 ## Tables
 
-### 1. `claims` (78 rows)
+### 1. `claims` (87 rows)
 
 Stores all processed claim data synced from DynamoDB.
 
 ```sql
-CREATE TABLE claims (
+CREATE TABLE IF NOT EXISTS claims (
     claim_id VARCHAR(100) PRIMARY KEY,
     patient_id VARCHAR(100),
     patient_name VARCHAR(200),
@@ -36,7 +36,8 @@ CREATE TABLE claims (
     recovery_opportunity VARCHAR(50),
     appeal_deadline VARCHAR(50),
     created_at VARCHAR(50),
-    updated_at VARCHAR(50)
+    updated_at VARCHAR(50),
+    appeal_pdf_url VARCHAR(500)
 );
 ```
 
@@ -53,10 +54,10 @@ CREATE TABLE claims (
 
 ### 2. `denial_trends` (8 rows)
 
-Aggregated denial patterns by category.
+Aggregated denial patterns by category and payer.
 
 ```sql
-CREATE TABLE denial_trends (
+CREATE TABLE IF NOT EXISTS denial_trends (
     trend_date DATE,
     payer VARCHAR(200),
     denial_code VARCHAR(20),
@@ -87,7 +88,7 @@ CREATE TABLE denial_trends (
 High-level KPIs for the dashboard.
 
 ```sql
-CREATE TABLE recovery_summary (
+CREATE TABLE IF NOT EXISTS recovery_summary (
     summary_date DATE,
     total_denied DECIMAL(12,2),
     total_recovered DECIMAL(12,2),
@@ -102,30 +103,50 @@ CREATE TABLE recovery_summary (
 
 ## Data Sync Process
 
-### How It Works
+### Architecture
 
 ```
-DynamoDB (claims table) → Lambda (hourly) → Redshift (full refresh)
+DynamoDB (claims table)
+    │
+    ▼ (EventBridge: every 1 hour)
+Lambda: denialrecover-dev-data-sync
+    │
+    ├── Scan all DynamoDB items (paginated)
+    ├── Parse analysisJson field
+    ├── Extract payer from appeal text (regex)
+    ├── Extract patient name from S3 key path
+    ├── Build appeal PDF URLs
+    │
+    ▼
+Redshift Serverless (full refresh: TRUNCATE + INSERT)
+    │
+    ▼
+QuickSight (Direct Query — live data)
 ```
 
-1. **EventBridge** triggers the `denialrecover-dev-data-sync` Lambda every hour
-2. Lambda **scans all items** from DynamoDB `denialrecover-dev-claims` table (with pagination)
-3. Lambda **parses `analysisJson`** field to extract denial codes, amounts, probabilities
-4. Lambda **TRUNCATES** all 3 Redshift tables
-5. Lambda **INSERTs** all claims in batches of 50
-6. Lambda **aggregates** denial_trends and recovery_summary from the claims data
-7. Lambda **waits** for SQL completion before returning
+### Sync Lambda Details
 
-### Key Fix: analysisJson Parsing
+- **Name**: `denialrecover-dev-data-sync`
+- **Runtime**: Python 3.11
+- **Memory**: 512 MB
+- **Timeout**: 300 seconds
+- **Schedule**: Every 1 hour (EventBridge)
+- **Source Code**: `sync_lambda/index.py`
 
-DynamoDB stores analysis results inside a JSON string field called `analysisJson`. The Lambda parses this to extract:
-- `denialReason` → `denial_code`
-- `dollarImpact` → `claim_amount`
-- `successProbability` → `success_probability`
-- `priorityScore` → `priority_score`
-- `expectedRecovery` → `expected_recovery`
-- `recoveryOpportunity` → `recovery_opportunity`
-- `appealDeadline` → `appeal_deadline`
+### Data Enrichment
+
+The sync Lambda enriches raw DynamoDB data:
+
+| Field | Source |
+|-------|--------|
+| `patient_name` | Extracted from S3 key path (e.g., `PAT_john_smith/`) |
+| `payer` | Regex from appeal letter text ("Dear [Payer] Appeals") or known payer list |
+| `denial_code` | `analysisJson.denialReason` |
+| `claim_amount` | `analysisJson.dollarImpact` |
+| `success_probability` | `analysisJson.successProbability` |
+| `expected_recovery` | `analysisJson.expectedRecovery` |
+| `recovery_opportunity` | `analysisJson.recoveryOpportunity` |
+| `appeal_pdf_url` | Constructed: `https://{bucket}.s3.us-east-1.amazonaws.com/appeals/{claimId}/appeal_letter.pdf` |
 
 ### Sync Behavior
 
@@ -134,7 +155,37 @@ DynamoDB stores analysis results inside a JSON string field called `analysisJson
 | New claim added to DynamoDB | Appears in Redshift after next hourly sync |
 | Claim deleted from DynamoDB | Removed from Redshift after next hourly sync |
 | Claim updated in DynamoDB | Updated in Redshift after next hourly sync |
-| Manual sync needed | Invoke Lambda: `aws lambda invoke --function-name denialrecover-dev-data-sync` |
+| Manual sync needed | `aws lambda invoke --function-name denialrecover-dev-data-sync --region us-east-1 out.json` |
+
+### SQL Execution
+
+The Lambda builds a single SQL statement containing:
+1. `TRUNCATE TABLE claims`
+2. Batch `INSERT INTO claims VALUES (...)` (50 rows per statement)
+3. `TRUNCATE TABLE denial_trends` + aggregate INSERT
+4. `TRUNCATE TABLE recovery_summary` + aggregate INSERT
+
+It uses `redshift-data` API with a polling loop (`describe_statement`) to wait for completion.
+
+---
+
+## Real-time Updates (WebSocket)
+
+In addition to hourly Redshift sync, claim changes are pushed to the dashboard in real-time:
+
+```
+DynamoDB Streams (claims table)
+    │
+    ▼
+Lambda: denialrecover-dev-ws-broadcast
+    │
+    ▼
+API Gateway WebSocket → All connected browsers
+```
+
+- **WebSocket URL**: `wss://i9ixftt1yb.execute-api.us-east-1.amazonaws.com/prod`
+- **Connections Table**: `denialrecover-dev-ws-connections` (DynamoDB, TTL: 24h)
+- **Batch Size**: 25 records, 5s batching window
 
 ---
 
@@ -146,7 +197,8 @@ DynamoDB stores analysis results inside a JSON string field called `analysisJson
 | `permission denied for relation claims` | IAM role lacked table permissions | `GRANT ALL ON TABLE ... TO PUBLIC` |
 | Async race condition | TRUNCATE + INSERT ran without waiting | Added `describe_statement` polling loop |
 | Empty denial_code/amount fields | Data nested in `analysisJson` string | Parse JSON and extract fields |
-| `INSERT has more expressions than target columns` | Table schema mismatch | Dropped and recreated tables with correct 15-column schema |
+| `INSERT has more expressions than target columns` | Table schema mismatch | Added `appeal_pdf_url` column |
+| Payer showing "unknown" | Not stored at top level in DynamoDB | Regex extraction from appeal letter text |
 
 ---
 
@@ -166,22 +218,31 @@ ORDER BY total_amount DESC;
 
 ### High-priority claims
 ```sql
-SELECT claim_id, patient_name, claim_amount, success_probability, expected_recovery
+SELECT claim_id, patient_name, payer, claim_amount, success_probability, expected_recovery
 FROM claims
 WHERE recovery_opportunity = 'HIGH'
 ORDER BY expected_recovery DESC;
 ```
 
-### Claims by status
+### Claims by payer
 ```sql
-SELECT status, COUNT(*) as count, SUM(claim_amount) as total
+SELECT payer, COUNT(*) as count, SUM(claim_amount) as total, AVG(success_probability) as avg_rate
 FROM claims
-GROUP BY status;
+GROUP BY payer
+ORDER BY total DESC;
 ```
 
 ### Recovery summary KPIs
 ```sql
 SELECT * FROM recovery_summary;
+```
+
+### Claims with appeal PDFs
+```sql
+SELECT claim_id, patient_name, appeal_pdf_url
+FROM claims
+WHERE appeal_pdf_url IS NOT NULL
+ORDER BY expected_recovery DESC;
 ```
 
 ---
@@ -191,25 +252,7 @@ SELECT * FROM recovery_summary;
 - **Data Source Type**: Amazon Redshift (Serverless)
 - **Workgroup**: `denialrecover-dev-workgroup`
 - **Database**: `denialrecover`
-- **Credentials**: `admin` / `DenialRecover2024!`
-- **Tables to visualize**: `claims`, `denial_trends`, `recovery_summary`
-
-### Recommended Visualizations
-
-1. **KPI** — Total Expected Recovery (SUM of `expected_recovery`)
-2. **Bar Chart** — Denial Trends by Code (`denial_code` vs `total_amount`)
-3. **Pie Chart** — Claims by Recovery Opportunity (HIGH/MEDIUM/LOW)
-4. **Table** — Priority Queue (claims sorted by `expected_recovery` DESC)
-5. **Gauge** — Average Success Rate
-6. **Line Chart** — Trends over time (when `trend_date` accumulates history)
-
----
-
-## Lambda Function
-
-- **Name**: `denialrecover-dev-data-sync`
-- **Runtime**: Python 3.11
-- **Memory**: 512 MB
-- **Timeout**: 300 seconds
-- **Schedule**: Every 1 hour (EventBridge)
-- **Source Code**: `lambda_sync_fixed.py` (in project root)
+- **Mode**: Direct Query (live, no SPICE import)
+- **Dashboard ID**: `4ce46504-95bf-4ad4-a34d-025e808ee0ea`
+- **Public Access**: CloudFront embedded at `https://d32s2hn1a29hfl.cloudfront.net`
+- **Embedding Type**: Registered user (`GenerateEmbedUrlForRegisteredUser`)
