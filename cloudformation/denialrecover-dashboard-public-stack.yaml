@@ -1,0 +1,752 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'DenialRecover AI - Public Dashboard via CloudFront (Anonymous QuickSight Embedding + Real-time WebSocket)'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  ProjectName:
+    Type: String
+    Default: denialrecover
+  QuickSightDashboardId:
+    Type: String
+    Description: The QuickSight Dashboard ID to embed publicly
+  QuickSightNamespace:
+    Type: String
+    Default: default
+    Description: QuickSight namespace
+  DataStackName:
+    Type: String
+    Default: denialrecover-dev
+    Description: Name of the data stack for importing DynamoDB stream ARN
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 Bucket for Static Dashboard Site
+  # ---------------------------------------------------------------------------
+  DashboardSiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-dashboard-site-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DashboardSiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardSiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${DashboardSiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Origin Access Control
+  # ---------------------------------------------------------------------------
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ProjectName}-${Environment}-dashboard-oac'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Distribution
+  # ---------------------------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub '${ProjectName} - Public Dashboard'
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          # S3 origin for static files
+          - Id: S3Origin
+            DomainName: !GetAtt DashboardSiteBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+          # API Gateway origin for embed URL generation
+          - Id: ApiOrigin
+            DomainName: !Sub '${EmbedApi}.execute-api.${AWS::Region}.amazonaws.com'
+            OriginPath: /prod
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /api/*
+            TargetOriginId: ApiOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # AllViewerExceptHostHeader
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Lambda Function - Generate Anonymous Embed URL
+  # ---------------------------------------------------------------------------
+  EmbedUrlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-embed-url-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: QuickSightEmbedPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - quicksight:GenerateEmbedUrlForRegisteredUser
+                  - quicksight:GetDashboardEmbedUrl
+                Resource: '*'
+
+  EmbedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-embed-url'
+      Description: Generates registered user QuickSight embed URL for public dashboard
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt EmbedUrlLambdaRole.Arn
+      Environment:
+        Variables:
+          DASHBOARD_ID: !Ref QuickSightDashboardId
+          AWS_ACCOUNT_ID_PARAM: !Ref AWS::AccountId
+          QUICKSIGHT_USER_ARN: !Sub 'arn:aws:quicksight:us-west-2:${AWS::AccountId}:user/default/Rackspace/racker-mari-9679be16'
+          ALLOWED_DOMAIN: !Sub 'https://${CloudFrontDistribution.DomainName}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+
+          quicksight = boto3.client('quicksight', region_name='us-east-1')
+
+          DASHBOARD_ID = os.environ['DASHBOARD_ID']
+          ACCOUNT_ID = os.environ['AWS_ACCOUNT_ID_PARAM']
+          USER_ARN = os.environ['QUICKSIGHT_USER_ARN']
+          ALLOWED_DOMAIN = os.environ['ALLOWED_DOMAIN']
+
+          def handler(event, context):
+              try:
+                  response = quicksight.generate_embed_url_for_registered_user(
+                      AwsAccountId=ACCOUNT_ID,
+                      UserArn=USER_ARN,
+                      ExperienceConfiguration={
+                          'Dashboard': {
+                              'InitialDashboardId': DASHBOARD_ID
+                          }
+                      },
+                      SessionLifetimeInMinutes=600,
+                      AllowedDomains=[ALLOWED_DOMAIN]
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': ALLOWED_DOMAIN,
+                          'Access-Control-Allow-Methods': 'GET,OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({
+                          'embedUrl': response['EmbedUrl']
+                      })
+                  }
+              except Exception as e:
+                  print(f'Error: {str(e)}')
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': ALLOWED_DOMAIN
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # API Gateway
+  # ---------------------------------------------------------------------------
+  EmbedApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-api'
+      Description: API for generating QuickSight anonymous embed URLs
+
+  EmbedApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EmbedApi
+      ParentId: !GetAtt EmbedApi.RootResourceId
+      PathPart: api
+
+  EmbedUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EmbedApi
+      ParentId: !Ref EmbedApiResource
+      PathPart: embed-url
+
+  EmbedUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EmbedApi
+      ResourceId: !Ref EmbedUrlResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EmbedUrlFunction.Arn}/invocations'
+
+  # CORS OPTIONS method
+  EmbedUrlOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EmbedApi
+      ResourceId: !Ref EmbedUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${CloudFrontDistribution.DomainName}'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  EmbedApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EmbedUrlMethod
+      - EmbedUrlOptionsMethod
+    Properties:
+      RestApiId: !Ref EmbedApi
+
+  EmbedApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref EmbedApi
+      DeploymentId: !Ref EmbedApiDeployment
+      StageName: prod
+
+  EmbedUrlLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmbedUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EmbedApi}/*'
+
+  # ---------------------------------------------------------------------------
+  # WebSocket API Gateway (Real-time Updates)
+  # ---------------------------------------------------------------------------
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-dashboard-ws'
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: '$request.body.action'
+
+  # DynamoDB table to track WebSocket connections
+  WebSocketConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-ws-connections'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM Role for WebSocket Lambda functions
+  WebSocketLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ws-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WebSocketPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                Resource: !GetAtt WebSocketConnectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # Lambda: $connect handler
+  WsConnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-ws-connect'
+      Description: Handles WebSocket $connect - stores connection ID
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref WebSocketConnectionsTable
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import time
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          def handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              # TTL: auto-expire connections after 24 hours
+              ttl = int(time.time()) + 86400
+
+              table.put_item(Item={
+                  'connectionId': connection_id,
+                  'connectedAt': int(time.time()),
+                  'ttl': ttl
+              })
+
+              return {'statusCode': 200, 'body': 'Connected'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda: $disconnect handler
+  WsDisconnectFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-ws-disconnect'
+      Description: Handles WebSocket $disconnect - removes connection ID
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref WebSocketConnectionsTable
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          def handler(event, context):
+              connection_id = event['requestContext']['connectionId']
+              table.delete_item(Key={'connectionId': connection_id})
+              return {'statusCode': 200, 'body': 'Disconnected'}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda: Default route handler (heartbeat/ping)
+  WsDefaultFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-ws-default'
+      Description: Handles WebSocket default messages (ping/pong)
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt WebSocketLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+
+          def handler(event, context):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'pong', 'type': 'heartbeat'})
+              }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Lambda: Broadcast updates to all connected clients (triggered by DynamoDB Stream)
+  WsBroadcastFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-ws-broadcast'
+      Description: Broadcasts real-time claim updates to all WebSocket clients
+      Runtime: python3.11
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 30
+      Role: !GetAtt WsBroadcastRole.Arn
+      Environment:
+        Variables:
+          CONNECTIONS_TABLE: !Ref WebSocketConnectionsTable
+          WEBSOCKET_ENDPOINT: !Sub 'https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from decimal import Decimal
+
+          dynamodb = boto3.resource('dynamodb')
+          connections_table = dynamodb.Table(os.environ['CONNECTIONS_TABLE'])
+
+          ENDPOINT = os.environ['WEBSOCKET_ENDPOINT']
+          apigw = boto3.client('apigatewaymanagementapi', endpoint_url=ENDPOINT)
+
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super().default(obj)
+
+          def handler(event, context):
+              # Parse DynamoDB Stream events into dashboard updates
+              updates = []
+              for record in event.get('Records', []):
+                  event_name = record['eventName']  # INSERT, MODIFY, REMOVE
+                  
+                  if event_name in ('INSERT', 'MODIFY'):
+                      new_image = record['dynamodb'].get('NewImage', {})
+                      claim_data = deserialize_dynamodb(new_image)
+                      updates.append({
+                          'type': 'claim_update',
+                          'action': event_name.lower(),
+                          'data': claim_data
+                      })
+                  elif event_name == 'REMOVE':
+                      old_image = record['dynamodb'].get('Keys', {})
+                      updates.append({
+                          'type': 'claim_update',
+                          'action': 'remove',
+                          'data': deserialize_dynamodb(old_image)
+                      })
+
+              if not updates:
+                  return {'statusCode': 200}
+
+              # Get all active connections
+              response = connections_table.scan(ProjectionExpression='connectionId')
+              connections = response.get('Items', [])
+
+              # Broadcast to all connected clients
+              message = json.dumps({
+                  'type': 'realtime_update',
+                  'updates': updates,
+                  'count': len(updates)
+              }, cls=DecimalEncoder)
+
+              stale_connections = []
+              for conn in connections:
+                  try:
+                      apigw.post_to_connection(
+                          ConnectionId=conn['connectionId'],
+                          Data=message.encode('utf-8')
+                      )
+                  except apigw.exceptions.GoneException:
+                      stale_connections.append(conn['connectionId'])
+                  except Exception as e:
+                      print(f"Error sending to {conn['connectionId']}: {e}")
+                      stale_connections.append(conn['connectionId'])
+
+              # Clean up stale connections
+              for conn_id in stale_connections:
+                  try:
+                      connections_table.delete_item(Key={'connectionId': conn_id})
+                  except Exception:
+                      pass
+
+              print(f"Broadcast {len(updates)} updates to {len(connections) - len(stale_connections)} clients")
+              return {'statusCode': 200}
+
+          def deserialize_dynamodb(item):
+              """Convert DynamoDB stream format to plain dict"""
+              result = {}
+              for key, value in item.items():
+                  if 'S' in value:
+                      result[key] = value['S']
+                  elif 'N' in value:
+                      result[key] = float(value['N'])
+                  elif 'BOOL' in value:
+                      result[key] = value['BOOL']
+                  elif 'NULL' in value:
+                      result[key] = None
+                  elif 'M' in value:
+                      result[key] = deserialize_dynamodb(value['M'])
+                  else:
+                      result[key] = str(value)
+              return result
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Separate role for broadcast (needs DynamoDB Stream + API GW manage connections)
+  WsBroadcastRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ws-broadcast-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BroadcastPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt WebSocketConnectionsTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableStreamArn'
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*'
+
+  # DynamoDB Stream Event Source Mapping (Claims table → Broadcast Lambda)
+  ClaimsStreamMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn:
+        Fn::ImportValue: !Sub '${DataStackName}-ClaimsTableStreamArn'
+      FunctionName: !GetAtt WsBroadcastFunction.Arn
+      StartingPosition: LATEST
+      BatchSize: 25
+      MaximumBatchingWindowInSeconds: 5
+      Enabled: true
+
+  # ---------------------------------------------------------------------------
+  # WebSocket API Routes & Integrations
+  # ---------------------------------------------------------------------------
+  WsConnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsConnectFunction.Arn}/invocations'
+
+  WsDisconnectIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDisconnectFunction.Arn}/invocations'
+
+  WsDefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WsDefaultFunction.Arn}/invocations'
+
+  WsConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsConnectIntegration}'
+
+  WsDisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsDisconnectIntegration}'
+
+  WsDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${WsDefaultIntegration}'
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WebSocketApi
+      StageName: prod
+      AutoDeploy: true
+
+  # Lambda permissions for API Gateway WebSocket
+  WsConnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsConnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/$connect'
+
+  WsDisconnectPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsDisconnectFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/$disconnect'
+
+  WsDefaultPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WsDefaultFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*/$default'
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+Outputs:
+  DashboardPublicUrl:
+    Description: Public URL to access the dashboard (share this link)
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  DashboardSiteBucket:
+    Description: S3 bucket for dashboard static files
+    Value: !Ref DashboardSiteBucket
+
+  EmbedApiEndpoint:
+    Description: API Gateway endpoint for embed URL generation
+    Value: !Sub 'https://${EmbedApi}.execute-api.${AWS::Region}.amazonaws.com/prod/api/embed-url'
+
+  WebSocketUrl:
+    Description: WebSocket URL for real-time dashboard updates
+    Value: !Sub 'wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}'
+    Export:
+      Name: !Sub '${AWS::StackName}-WebSocketUrl'
+
+  WebSocketConnectionsTable:
+    Description: DynamoDB table tracking active WebSocket connections
+    Value: !Ref WebSocketConnectionsTable
+
+  DeployCommand:
+    Description: Command to upload the dashboard HTML to S3
+    Value: !Sub 'aws s3 sync ./dashboard-site s3://${DashboardSiteBucket}/ --delete'
+
+  InvalidateCacheCommand:
+    Description: Command to invalidate CloudFront cache after updates
+    Value: !Sub 'aws cloudfront create-invalidation --distribution-id ${CloudFrontDistribution} --paths "/*"'

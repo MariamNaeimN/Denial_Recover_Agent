@@ -1687,12 +1687,14 @@ Resources:
       MemorySize: 512
       Timeout: 60
       Role: !GetAtt GenerateAppealPdfRole.Arn
+      Layers:
+        - arn:aws:lambda:us-east-1:193786182229:layer:denialrecover-dev-reportlab-layer:1
       Environment:
         Variables:
           DATA_BUCKET:
             Fn::ImportValue: !Sub '${DataStackName}-DataBucket'
           LOG_LEVEL: !If [IsProd, 'INFO', 'DEBUG']
-          CODE_VERSION: '2026-05-19-v4'
+          CODE_VERSION: '2026-05-19-v8'
       Code:
         ZipFile: |
           import os
@@ -1745,7 +1747,8 @@ Resources:
                       Bucket=bucket,
                       Key=pdf_key,
                       Body=pdf_bytes,
-                      ContentType='application/pdf'
+                      ContentType='application/pdf',
+                      ServerSideEncryption='AES256'
                   )
                   
                   logger.info(f"PDF generated and saved to s3://{bucket}/{pdf_key}")
@@ -1766,7 +1769,8 @@ Resources:
                       Bucket=bucket,
                       Key=txt_key,
                       Body=appeal_text.encode('utf-8'),
-                      ContentType='text/plain'
+                      ContentType='text/plain',
+                      ServerSideEncryption='AES256'
                   )
                   return {
                       'statusCode': 200,
@@ -1787,24 +1791,24 @@ Resources:
 
               # ---- Constants ----
               PAGE_W, PAGE_H = 612, 792
-              MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 72, 72, 72, 72
+              MARGIN_L, MARGIN_R, MARGIN_T, MARGIN_B = 72, 72, 60, 60
               CONTENT_W = PAGE_W - MARGIN_L - MARGIN_R
               TOP_Y = PAGE_H - MARGIN_T
 
-              # Font sizes
-              TITLE_SIZE = 18
-              HEADER_SIZE = 13
-              BODY_SIZE = 10
+              # Font sizes (professional look)
+              TITLE_SIZE = 16
+              HEADER_SIZE = 12
+              BODY_SIZE = 10.5
               TABLE_SIZE = 9.5
-              SMALL_SIZE = 8
+              SMALL_SIZE = 8.5
 
-              # Leading (line spacing)
-              TITLE_LEAD = 26
-              HEADER_LEAD = 20
-              BODY_LEAD = 14.5
+              # Leading (line spacing - more breathing room)
+              TITLE_LEAD = 24
+              HEADER_LEAD = 22
+              BODY_LEAD = 15
               TABLE_LEAD = 16
-              BULLET_LEAD = 14.5
-              BLANK_LEAD = 10
+              BULLET_LEAD = 15
+              BLANK_LEAD = 8
 
               # ---- Helpers ----
               def esc(t):
@@ -1945,17 +1949,20 @@ Resources:
                       self.current_page.append(f'{x:.1f} {y:.1f} {w:.1f} {h:.1f} re S')
 
                   def render_title(self, text):
-                      self.check_space(TITLE_LEAD + 10)
+                      self.check_space(TITLE_LEAD + 16)
                       tw = str_width(text, TITLE_SIZE)
                       x = MARGIN_L + (CONTENT_W - tw) / 2
                       self.draw_text(x, self.y, 'F2', TITLE_SIZE, text)
                       self.y -= TITLE_LEAD
+                      # Underline title
+                      self.draw_line(MARGIN_L + 40, self.y + 4, PAGE_W - MARGIN_R - 40, self.y + 4, 1.0)
+                      self.y -= 8
 
                   def render_hr(self):
-                      self.check_space(10)
-                      self.y -= 5
-                      self.draw_line(MARGIN_L, self.y, PAGE_W - MARGIN_R, self.y, 0.75)
-                      self.y -= 5
+                      self.check_space(12)
+                      self.y -= 6
+                      self.draw_line(MARGIN_L, self.y, PAGE_W - MARGIN_R, self.y, 0.5)
+                      self.y -= 6
 
                   def render_table(self, rows):
                       col1_w = 140
@@ -1986,26 +1993,28 @@ Resources:
                       self.y -= 4
 
                   def render_header(self, text):
-                      self.check_space(HEADER_LEAD + 6)
-                      self.draw_text(MARGIN_L, self.y, 'F2', HEADER_SIZE, text)
+                      self.check_space(HEADER_LEAD + 16)
+                      self.y -= 8  # Extra space before header
+                      # Gray background bar behind header text
+                      bar_h = HEADER_SIZE + 8
+                      self.draw_rect(MARGIN_L, self.y - 2, CONTENT_W, bar_h, 0.92)
+                      self.draw_text(MARGIN_L + 8, self.y + 2, 'F2', HEADER_SIZE, text.upper())
                       self.y -= HEADER_LEAD
 
                   def render_body(self, text):
-                      wrapped = wrap_line(text, 90)
+                      wrapped = wrap_line(text, 88)
                       self.check_space(BODY_LEAD * len(wrapped))
                       for ln in wrapped:
-                          self.draw_text(MARGIN_L, self.y, 'F1', BODY_SIZE, ln)
+                          self.draw_text(MARGIN_L + 4, self.y, 'F1', BODY_SIZE, ln)
                           self.y -= BODY_LEAD
 
                   def render_bullet(self, text):
-                      wrapped = wrap_line(text, 85)
+                      wrapped = wrap_line(text, 82)
                       self.check_space(BULLET_LEAD * len(wrapped))
-                      # Use \x95 which is bullet in WinAnsiEncoding
-                      bullet_prefix = '\x95  '
-                      self.draw_text(MARGIN_L + 12, self.y, 'F1', BODY_SIZE, bullet_prefix + wrapped[0])
+                      self.draw_text(MARGIN_L + 16, self.y, 'F1', BODY_SIZE, '\x95  ' + wrapped[0])
                       self.y -= BULLET_LEAD
                       for ln in wrapped[1:]:
-                          self.draw_text(MARGIN_L + 24, self.y, 'F1', BODY_SIZE, ln)
+                          self.draw_text(MARGIN_L + 28, self.y, 'F1', BODY_SIZE, ln)
                           self.y -= BULLET_LEAD
 
                   def render_numbered(self, text):

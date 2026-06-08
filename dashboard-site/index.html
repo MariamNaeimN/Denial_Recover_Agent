@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DenialRecover AI</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0%25' y1='0%25' x2='100%25' y2='100%25'%3E%3Cstop offset='0%25' stop-color='%23818cf8'/%3E%3Cstop offset='100%25' stop-color='%2334d399'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='32' height='32' rx='8' fill='%230f1117'/%3E%3Cpath d='M16 5L6 10l10 5 10-5-10-5z' fill='none' stroke='url(%23g)' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M6 20l10 5 10-5' fill='none' stroke='url(%23g)' stroke-width='2' stroke-linejoin='round'/%3E%3Cpath d='M6 15l10 5 10-5' fill='none' stroke='url(%23g)' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --indigo: #6366f1;
+            --indigo-light: #818cf8;
+            --green: #34d399;
+            --gold: #e0c97f;
+            --bg: #08090d;
+            --border: rgba(255,255,255,0.06);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: var(--bg);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* ── Header ── */
+        header {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 100;
+            background: rgba(8,9,13,0.75);
+            backdrop-filter: blur(24px) saturate(1.6);
+            -webkit-backdrop-filter: blur(24px) saturate(1.6);
+            border-bottom: 1px solid var(--border);
+            padding: 0 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 42px;
+            animation: headerSlideDown 0.6s cubic-bezier(0.16,1,0.3,1) both;
+            overflow: hidden;
+        }
+
+        /* Ambient glow behind header */
+        header::before {
+            content: '';
+            position: absolute;
+            top: -50%;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 400px;
+            height: 100px;
+            background: radial-gradient(ellipse, rgba(99,102,241,0.15) 0%, transparent 70%);
+            pointer-events: none;
+            animation: glowPulse 3s ease-in-out infinite;
+        }
+
+        @keyframes glowPulse {
+            0%, 100% { opacity: 0.6; transform: translateX(-50%) scaleX(1); }
+            50%      { opacity: 1;   transform: translateX(-50%) scaleX(1.2); }
+        }
+
+        @keyframes headerSlideDown {
+            from { transform: translateY(-100%); opacity: 0; }
+            to   { transform: translateY(0);     opacity: 1; }
+        }
+
+        header::after {
+            content: '';
+            position: absolute;
+            bottom: -1px; left: 0; right: 0;
+            height: 2px;
+            background: linear-gradient(90deg,
+                transparent 0%,
+                rgba(99,102,241,0.8) 20%,
+                rgba(52,211,153,0.8) 50%,
+                rgba(224,201,127,0.6) 80%,
+                transparent 100%);
+            background-size: 200% 100%;
+            animation: borderFlow 3s linear infinite;
+        }
+
+        @keyframes borderFlow {
+            0%   { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        /* Scanning light effect across header */
+        .header-scan {
+            position: absolute;
+            top: 0; left: -100%;
+            width: 50%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.03), transparent);
+            animation: headerScan 4s ease-in-out infinite;
+            pointer-events: none;
+        }
+
+        @keyframes headerScan {
+            0%   { left: -50%; }
+            100% { left: 150%; }
+        }
+
+        /* ── Logo ── */
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            animation: fadeInLeft 0.8s cubic-bezier(0.16,1,0.3,1) 0.2s both;
+        }
+
+        @keyframes fadeInLeft {
+            from { transform: translateX(-20px); opacity: 0; }
+            to   { transform: translateX(0);     opacity: 1; }
+        }
+
+        .logo-icon {
+            width: 22px; height: 22px;
+            animation: iconSpin 0.8s cubic-bezier(0.34,1.56,0.64,1) 0.4s both;
+            position: relative;
+        }
+
+        .logo-icon::after {
+            content: '';
+            position: absolute;
+            inset: -4px;
+            border-radius: 50%;
+            border: 1px solid rgba(129,140,248,0.3);
+            animation: iconRing 3s ease-in-out infinite;
+        }
+
+        @keyframes iconRing {
+            0%, 100% { transform: scale(1); opacity: 0.5; }
+            50%      { transform: scale(1.3); opacity: 0; }
+        }
+
+        @keyframes iconSpin {
+            from { transform: rotate(-180deg) scale(0); opacity: 0; }
+            to   { transform: rotate(0) scale(1);       opacity: 1; }
+        }
+
+        .logo-icon svg { 
+            width: 100%; height: 100%;
+            filter: drop-shadow(0 0 6px rgba(129,140,248,0.4));
+        }
+
+        .logo h1 {
+            font-size: 0.85rem;
+            font-weight: 600;
+            background: linear-gradient(135deg, #e0e7ff 0%, #a5b4fc 60%, #34d399 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+            letter-spacing: -0.02em;
+            background-size: 200% 100%;
+            animation: textShimmer 4s linear infinite;
+        }
+
+        @keyframes textShimmer {
+            0%   { background-position: 200% 0; }
+            100% { background-position: -200% 0; }
+        }
+
+        .powered-by {
+            font-size: 0.65rem;
+            color: rgba(255,255,255,0.5);
+            font-weight: 400;
+            margin-left: 10px;
+            padding-left: 10px;
+            border-left: 1px solid rgba(255,255,255,0.1);
+            letter-spacing: 0.02em;
+            white-space: nowrap;
+            animation: fadeInUp 0.6s cubic-bezier(0.16,1,0.3,1) 0.5s both;
+        }
+
+        @keyframes fadeInUp {
+            from { transform: translateY(8px); opacity: 0; }
+            to   { transform: translateY(0);   opacity: 1; }
+        }
+
+        .powered-by strong {
+            color: var(--gold);
+            font-weight: 600;
+            text-shadow: 0 0 12px rgba(224,201,127,0.4);
+            animation: goldGlow 2s ease-in-out infinite;
+        }
+
+        @keyframes goldGlow {
+            0%, 100% { text-shadow: 0 0 8px rgba(224,201,127,0.3); }
+            50%      { text-shadow: 0 0 16px rgba(224,201,127,0.6); }
+        }
+
+        /* ── Header right ── */
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            animation: fadeInRight 0.8s cubic-bezier(0.16,1,0.3,1) 0.3s both;
+        }
+
+        @keyframes fadeInRight {
+            from { transform: translateX(20px); opacity: 0; }
+            to   { transform: translateX(0);    opacity: 1; }
+        }
+
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 0.65rem;
+            color: rgba(255,255,255,0.45);
+            text-transform: uppercase;
+            letter-spacing: 0.07em;
+            font-weight: 500;
+        }
+
+        .status-dot {
+            width: 7px; height: 7px;
+            border-radius: 50%;
+            position: relative;
+            flex-shrink: 0;
+        }
+
+        .status-dot::after {
+            content: '';
+            position: absolute;
+            inset: -4px;
+            border-radius: 50%;
+            border: 1px solid currentColor;
+            opacity: 0;
+            animation: ripple 2.5s ease-out infinite;
+        }
+
+        @keyframes ripple {
+            0%   { transform: scale(0.5); opacity: 0.8; }
+            100% { transform: scale(2);   opacity: 0; }
+        }
+
+        .status-dot.connected    { background: var(--green); color: var(--green); box-shadow: 0 0 8px rgba(52,211,153,0.6); }
+        .status-dot.disconnected { background: #f87171; color: #f87171; box-shadow: 0 0 8px rgba(248,113,113,0.5); }
+        .status-dot.connecting   { background: #fbbf24; color: #fbbf24; box-shadow: 0 0 8px rgba(251,191,36,0.5); animation: blink 0.8s ease-in-out infinite; }
+
+        @keyframes blink {
+            0%,100% { opacity: 1; }
+            50%      { opacity: 0.3; }
+        }
+
+        /* ── Dashboard container ── */
+        .dashboard-container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding-top: 42px;
+            height: 100vh;
+        }
+
+        /* ── Loading screen ── */
+        .loading {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 24px;
+        }
+
+        .loader-wrap {
+            position: relative;
+            width: 56px; height: 56px;
+        }
+
+        .loader-ring {
+            position: absolute;
+            inset: 0;
+            border-radius: 50%;
+            border: 2px solid transparent;
+        }
+
+        .loader-ring:nth-child(1) { border-top-color: var(--indigo-light); animation: spin 1s linear infinite; }
+        .loader-ring:nth-child(2) { inset: 8px; border-bottom-color: var(--green); animation: spin 1.4s linear infinite reverse; }
+        .loader-ring:nth-child(3) { inset: 16px; border-left-color: var(--gold); animation: spin 1.8s linear infinite; }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .loading-text {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .loading-text p {
+            color: rgba(255,255,255,0.5);
+            font-size: 0.8rem;
+            font-weight: 400;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+        }
+
+        .loading-dots { display: flex; gap: 5px; }
+
+        .loading-dots span {
+            width: 4px; height: 4px;
+            border-radius: 50%;
+            background: var(--indigo-light);
+            animation: dotBounce 1.2s ease-in-out infinite;
+        }
+
+        .loading-dots span:nth-child(2) { animation-delay: 0.2s; background: var(--green); }
+        .loading-dots span:nth-child(3) { animation-delay: 0.4s; background: var(--gold); }
+
+        @keyframes dotBounce {
+            0%,80%,100% { transform: scale(0.6); opacity: 0.4; }
+            40%          { transform: scale(1.2); opacity: 1; }
+        }
+
+        /* ── Error state ── */
+        .error {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            gap: 14px;
+        }
+
+        .error p { color: rgba(255,255,255,0.4); font-size: 0.82rem; }
+
+        .error button {
+            padding: 9px 24px;
+            background: linear-gradient(135deg, var(--indigo) 0%, var(--indigo-light) 100%);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 0.78rem;
+            font-weight: 500;
+            transition: all 0.25s cubic-bezier(0.16,1,0.3,1);
+            box-shadow: 0 4px 16px rgba(99,102,241,0.35);
+        }
+
+        .error button:hover {
+            transform: translateY(-2px) scale(1.02);
+            box-shadow: 0 8px 24px rgba(99,102,241,0.5);
+        }
+
+        /* ── Dashboard iframe — no animation ── */
+        #dashboard-frame {
+            flex: 1;
+            width: 100%;
+            height: calc(100vh - 42px);
+            border: none;
+            background: #fff;
+        }
+
+        .hidden { display: none !important; }
+
+        /* ── Toast notifications ── */
+        .toast-container {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            z-index: 1000;
+            display: flex;
+            flex-direction: column-reverse;
+            gap: 8px;
+            max-width: 310px;
+        }
+
+        .toast {
+            background: rgba(16,18,28,0.96);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 12px;
+            padding: 11px 14px;
+            box-shadow: 0 16px 48px rgba(0,0,0,0.6);
+            animation: toastIn 0.5s cubic-bezier(0.16,1,0.3,1) both;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .toast::before {
+            content: '';
+            position: absolute;
+            top: 0; left: -100%;
+            width: 60%; height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.04), transparent);
+            animation: toastShimmer 0.8s ease 0.1s both;
+        }
+
+        @keyframes toastShimmer {
+            from { left: -100%; }
+            to   { left: 200%; }
+        }
+
+        .toast.insert { border-left: 3px solid var(--green); }
+        .toast.modify { border-left: 3px solid #60a5fa; }
+        .toast.remove { border-left: 3px solid #f87171; }
+
+        .toast-icon {
+            width: 28px; height: 28px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.85rem;
+            flex-shrink: 0;
+        }
+
+        .toast.insert .toast-icon { background: rgba(52,211,153,0.12); }
+        .toast.modify .toast-icon { background: rgba(96,165,250,0.12); }
+        .toast.remove .toast-icon { background: rgba(248,113,113,0.12); }
+
+        .toast-content { flex: 1; }
+        .toast-title { font-weight: 500; font-size: 0.75rem; color: rgba(255,255,255,0.9); }
+        .toast-detail { color: rgba(255,255,255,0.35); margin-top: 2px; font-size: 0.68rem; }
+
+        @keyframes toastIn {
+            from { transform: translateX(40px) scale(0.92); opacity: 0; }
+            to   { transform: translateX(0) scale(1); opacity: 1; }
+        }
+
+        @keyframes toastOut {
+            from { transform: scale(1); opacity: 1; }
+            to   { transform: scale(0.92); opacity: 0; }
+        }
+    </style>
+</head>
+<body>
+
+    <svg width="0" height="0" style="position:absolute">
+        <defs>
+            <linearGradient id="logo-gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" stop-color="#818cf8"/>
+                <stop offset="100%" stop-color="#34d399"/>
+            </linearGradient>
+        </defs>
+    </svg>
+
+    <header>
+        <div class="header-scan"></div>
+        <div class="logo">
+            <div class="logo-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="url(#logo-gradient)" stroke-width="2" stroke-linejoin="round">
+                    <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+                    <path d="M2 17l10 5 10-5"/>
+                    <path d="M2 12l10 5 10-5"/>
+                </svg>
+            </div>
+            <h1>DenialRecover AI</h1>
+            <span class="powered-by">powered by <strong>Rackspace</strong></span>
+        </div>
+        <div class="header-right">
+            <div class="status" id="ws-status">
+                <span class="status-dot connecting" id="ws-dot"></span>
+                <span id="ws-label">Connecting</span>
+            </div>
+            <div class="status">
+                <span class="status-dot connected"></span>
+                <span>Live</span>
+            </div>
+        </div>
+    </header>
+
+    <div class="toast-container" id="toast-container"></div>
+
+    <div class="dashboard-container">
+        <div id="loading" class="loading">
+            <div class="loader-wrap">
+                <div class="loader-ring"></div>
+                <div class="loader-ring"></div>
+                <div class="loader-ring"></div>
+            </div>
+            <div class="loading-text">
+                <p>Loading dashboard</p>
+                <div class="loading-dots">
+                    <span></span><span></span><span></span>
+                </div>
+            </div>
+        </div>
+
+        <div id="error" class="error hidden">
+            <p>Unable to load dashboard</p>
+            <button onclick="loadDashboard()">Retry</button>
+        </div>
+
+        <iframe id="dashboard-frame" class="hidden" title="DenialRecover AI Dashboard"></iframe>
+    </div>
+
+    <script>
+        const WS_URL = '{{WEBSOCKET_URL}}';
+
+        async function loadDashboard() {
+            const loading = document.getElementById('loading');
+            const error   = document.getElementById('error');
+            const frame   = document.getElementById('dashboard-frame');
+
+            loading.classList.remove('hidden');
+            error.classList.add('hidden');
+            frame.classList.add('hidden');
+
+            try {
+                const res = await fetch('/api/embed-url');
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const data = await res.json();
+                if (!data.embedUrl) throw new Error('No embed URL');
+
+                frame.src = data.embedUrl;
+                frame.onload = () => {
+                    loading.classList.add('hidden');
+                    frame.classList.remove('hidden');
+                };
+                setTimeout(() => {
+                    loading.classList.add('hidden');
+                    frame.classList.remove('hidden');
+                }, 5000);
+            } catch (err) {
+                console.error(err);
+                loading.classList.add('hidden');
+                error.classList.remove('hidden');
+            }
+        }
+
+        class RealtimeConnection {
+            constructor(url) {
+                this.url = url; this.ws = null;
+                this.attempts = 0; this.maxAttempts = 10;
+                this.delay = 1000; this.heartbeat = null;
+                this.connect();
+            }
+
+            connect() {
+                if (this.url === '{{WEBSOCKET_URL}}') { this.setStatus('disconnected','Offline'); return; }
+                this.setStatus('connecting','Connecting');
+                try {
+                    this.ws = new WebSocket(this.url);
+                    this.ws.onopen    = () => { this.attempts = 0; this.delay = 1000; this.setStatus('connected','Live'); this.startHeartbeat(); };
+                    this.ws.onmessage = e  => this.handleMessage(e.data);
+                    this.ws.onclose   = () => { this.stopHeartbeat(); this.setStatus('disconnected','Offline'); this.scheduleReconnect(); };
+                    this.ws.onerror   = () => this.setStatus('disconnected','Error');
+                } catch { this.scheduleReconnect(); }
+            }
+
+            handleMessage(data) {
+                try {
+                    const msg = JSON.parse(data);
+                    if (msg.type === 'realtime_update') this.processUpdates(msg.updates);
+                } catch {}
+            }
+
+            processUpdates(updates) {
+                if (!updates) return;
+                updates.forEach(u => {
+                    const c = u.data || {};
+                    const map = {
+                        insert: { title:'New Claim',     detail:`${c.claimId||'—'} · $${(c.claimAmount||0).toLocaleString()}`, type:'insert', icon:'✦' },
+                        modify: { title:'Claim Updated', detail:`${c.claimId||'—'} · ${c.status||'modified'}`,                 type:'modify', icon:'↻' },
+                        remove: { title:'Claim Removed', detail:c.claimId||'—',                                                 type:'remove', icon:'✕' },
+                    };
+                    const m = map[u.action] || { title:'Update', detail:'Data changed', type:'modify', icon:'·' };
+                    this.showToast(m.title, m.detail, m.type, m.icon);
+                });
+            }
+
+            showToast(title, detail, type, icon) {
+                const container = document.getElementById('toast-container');
+                const t = document.createElement('div');
+                t.className = `toast ${type}`;
+                t.innerHTML = `<div class="toast-icon">${icon}</div><div class="toast-content"><div class="toast-title">${title}</div><div class="toast-detail">${detail}</div></div>`;
+                container.appendChild(t);
+                setTimeout(() => {
+                    t.style.animation = 'toastOut 0.35s forwards';
+                    setTimeout(() => t.remove(), 350);
+                }, 4500);
+                while (container.children.length > 4) container.firstChild.remove();
+            }
+
+            startHeartbeat() {
+                this.heartbeat = setInterval(() => {
+                    if (this.ws?.readyState === WebSocket.OPEN)
+                        this.ws.send(JSON.stringify({ action:'ping' }));
+                }, 30000);
+            }
+
+            stopHeartbeat() { if (this.heartbeat) clearInterval(this.heartbeat); }
+
+            scheduleReconnect() {
+                if (this.attempts >= this.maxAttempts) return;
+                this.attempts++;
+                const d = Math.min(this.delay * Math.pow(2, this.attempts - 1), 30000);
+                this.setStatus('connecting','Retry');
+                setTimeout(() => this.connect(), d);
+            }
+
+            setStatus(state, label) {
+                document.getElementById('ws-dot').className = `status-dot ${state}`;
+                document.getElementById('ws-label').textContent = label;
+            }
+        }
+
+        loadDashboard();
+        const realtime = new RealtimeConnection(WS_URL);
+    </script>
+</body>
+</html>
